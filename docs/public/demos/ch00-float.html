@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>浮点数格式对比</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#6b7280;--card:#f5f7fa;--border:#d8dee4;--accent:#2563eb;--sign:#7c3aed;--exp:#2563eb;--man:#059669;--bad:#dc2626;--bad-soft:#fee2e2}
+@media (prefers-color-scheme: dark){:root{--bg:#16181d;--fg:#e6e8eb;--muted:#9aa3ae;--card:#1f232a;--border:#363c45;--accent:#60a5fa;--sign:#c4b5fd;--exp:#60a5fa;--man:#34d399;--bad:#f87171;--bad-soft:#4a1d1d}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+body{padding:12px;overflow-x:hidden}
+h3{margin:0 0 6px;font-size:16px}
+h4{margin:0 0 6px;font-size:14px}
+.muted{color:var(--muted);font-size:12.5px}
+.row{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin:8px 0}
+button{font:inherit;padding:4px 9px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg);cursor:pointer;font-size:13px}
+input[type=text],input[type=number]{font:inherit;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg);width:140px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.fmt{border-top:1px solid var(--border);padding:8px 0}
+.fmt:first-child{border-top:0}
+.fmt .head{display:flex;flex-wrap:wrap;justify-content:space-between;gap:6px}
+.fmt .name{font-weight:700}
+.fmt .val{font-family:ui-monospace,Menlo,monospace;font-weight:700}
+.fmt .err{font-size:12.5px;color:var(--muted)}
+.fmt.bad .val{color:var(--bad)}
+.bits{display:flex;flex-wrap:wrap;gap:1px;margin-top:4px}
+.bits span{font-family:ui-monospace,Menlo,monospace;font-size:11px;width:14px;text-align:center;border-radius:2px;color:#fff;line-height:17px}
+.bits .s{background:var(--sign)}.bits .e{background:var(--exp)}.bits .m{background:var(--man)}
+.legend span{display:inline-block;width:10px;height:10px;border-radius:2px;margin:0 3px 0 8px;vertical-align:middle}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:4px;border-bottom:1px solid var(--border);text-align:right}
+th:first-child,td:first-child{text-align:left}
+</style>
+</head>
+<body>
+<h3>同一个数，在 fp32 / fp16 / bf16 里变成什么？</h3>
+<div class="muted">输入任意一个数，看它被存进三种格式后实际变成了多少。色块是它在内存里的二进制位：<span class="legend"><span style="background:var(--sign)"></span>符号 <span style="background:var(--exp)"></span>指数（管范围）<span style="background:var(--man)"></span>尾数（管精度）</span></div>
+
+<div class="row">
+  <input id="num" type="text" value="3.14159265" aria-label="输入一个数">
+  <button data-v="3.14159265">π</button>
+  <button data-v="1000.5">1000.5</button>
+  <button data-v="70000">70000</button>
+  <button data-v="0.00000001">1e-8</button>
+  <button data-v="0.1">0.1</button>
+  <button data-v="65504">65504</button>
+</div>
+
+<div class="card" id="out"></div>
+
+<div class="card">
+  <h4>累加实验：反复加一个小数</h4>
+  <div class="muted">从“起始值”开始，每次加上 Δ，一共加 N 次，每一步的结果都存回该格式。看看哪种格式会“加不动”。</div>
+  <div class="row">
+    起始值 <input id="s0" type="number" value="1000" style="width:90px">
+    Δ <input id="d" type="number" value="1" style="width:80px">
+    N <input id="n" type="number" value="100" style="width:80px">
+    <button id="run">运行</button>
+    <button data-acc="1000,1,100">1000 + 1×100</button>
+    <button data-acc="0,0.01,10000">0 + 0.01×10000</button>
+  </div>
+  <table><thead><tr><th>格式</th><th>结果</th><th>正确答案</th></tr></thead><tbody id="acc"></tbody></table>
+</div>
+
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const FMTS=[
+    {name:'fp32（4 字节）',e:8,m:23},
+    {name:'fp16（2 字节）',e:5,m:10},
+    {name:'bf16（2 字节）',e:8,m:7},
+  ];
+  function rhe(v){const f=Math.floor(v),d=v-f; if(d>0.5)return f+1; if(d<0.5)return f; return (f%2===0)?f:f+1;}
+  // 把 x 舍入到 (e 位指数, m 位尾数) 的浮点格式（四舍六入五成双）
+  function quant(x,e,m){
+    if(!isFinite(x)||x===0) return x;
+    const bias=2**(e-1)-1, emin=1-bias, max=(2-2**-m)*2**bias;
+    const s=x<0?-1:1, a=Math.abs(x);
+    let E=Math.floor(Math.log2(a)); if(2**E>a)E--; if(2**(E+1)<=a)E++;
+    if(E<emin)E=emin;
+    const ulp=2**(E-m);
+    const r=rhe(a/ulp)*ulp;
+    if(r>max) return s*Infinity;
+    return s*r;
+  }
+  function bits(v,e,m){
+    const bias=2**(e-1)-1, emin=1-bias;
+    const sb=(v<0||Object.is(v,-0))?1:0, a=Math.abs(v);
+    let ef,mf;
+    if(a===Infinity){ef=2**e-1;mf=0;}
+    else if(a===0){ef=0;mf=0;}
+    else{
+      let E=Math.floor(Math.log2(a)); if(2**E>a)E--; if(2**(E+1)<=a)E++;
+      if(E<emin){ef=0;mf=Math.round(a/2**(emin-m));}
+      else{ef=E+bias;mf=Math.round((a/2**E-1)*2**m);}
+    }
+    const es=ef.toString(2).padStart(e,'0'), ms=mf.toString(2).padStart(m,'0');
+    return `<span class="s">${sb}</span>`+[...es].map(c=>`<span class="e">${c}</span>`).join('')+[...ms].map(c=>`<span class="m">${c}</span>`).join('');
+  }
+  function show(v){
+    if(!isFinite(v)) return v>0?'+∞（溢出）':(v<0?'−∞（溢出）':'NaN');
+    if(v===0) return '0';
+    const a=Math.abs(v);
+    if(a<1e-4||a>=1e7) return v.toPrecision(8);
+    return String(parseFloat(v.toPrecision(10)));
+  }
+  function render(){
+    const x=parseFloat($('num').value);
+    if(isNaN(x)){$('out').innerHTML='<span class="muted">请输入一个数字</span>';return;}
+    $('out').innerHTML=FMTS.map(f=>{
+      const q=quant(x,f.e,f.m);
+      let note='', bad=false;
+      if(!isFinite(q)){note='超出了这种格式能表示的最大值，变成了无穷大';bad=true;}
+      else if(q===0&&x!==0){note='太小了，被舍入成 0（下溢）';bad=true;}
+      else if(q===x){note='精确存下，没有误差';}
+      else{const rel=Math.abs(q-x)/Math.abs(x);note='误差 '+show(q-x)+'（相对误差 '+(rel*100).toPrecision(2)+'%）';}
+      return `<div class="fmt${bad?' bad':''}"><div class="head"><span class="name">${f.name}　<span class="muted">${f.e} 位指数 + ${f.m} 位尾数</span></span><span class="val">${show(q)}</span></div><div class="err">${note}</div><div class="bits">${bits(q,f.e,f.m)}</div></div>`;
+    }).join('');
+  }
+  function runAcc(){
+    const s0=parseFloat($('s0').value), d=parseFloat($('d').value), n=Math.min(200000,Math.max(0,parseInt($('n').value)||0));
+    const truth=s0+d*n;
+    $('acc').innerHTML=FMTS.map(f=>{
+      let s=quant(s0,f.e,f.m); const dq=quant(d,f.e,f.m);
+      for(let i=0;i<n;i++) s=quant(s+dq,f.e,f.m);
+      const off=Math.abs(s-truth)>Math.abs(truth)*0.01+1e-12;
+      return `<tr><td>${f.name}</td><td class="mono" style="${off?'color:var(--bad);font-weight:700':''}">${show(s)}</td><td class="mono">${show(truth)}</td></tr>`;
+    }).join('');
+  }
+  $('num').addEventListener('input',render);
+  document.querySelectorAll('[data-v]').forEach(b=>b.onclick=()=>{$('num').value=b.dataset.v;render();});
+  document.querySelectorAll('[data-acc]').forEach(b=>b.onclick=()=>{const [a,c,n]=b.dataset.acc.split(',');$('s0').value=a;$('d').value=c;$('n').value=n;runAcc();});
+  $('run').onclick=runAcc;
+  render(); runAcc();
+})();
+</script>
+</body>
+</html>

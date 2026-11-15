@@ -5,7 +5,7 @@
 这是 Stanford [CS336《Language Modeling from Scratch》](https://cs336.stanford.edu/)（Spring 2026）全部 18 讲的中文重讲版。读者设定为 Android / iOS 工程师，只要求一点微积分和一点 Python。
 
 - **19 章 + 2 个附录**，每一讲对应一章，另有一章从零补齐所需数学（第 0 章）
-- **46 个交互演示**：BPE 合并动画、自注意力单步计算、Roofline、kernel 融合、集合通信、ZeRO 显存、流水线气泡、KV Cache、投机解码、缩放定律拟合、IsoFLOP、μP、困惑度、MinHash 去重、DPO、GRPO、ViT patch 等
+- **48 个交互演示**：BPE 合并动画、自注意力单步计算、Roofline、kernel 融合、集合通信、ZeRO 显存、流水线气泡、KV Cache、投机解码、缩放定律拟合、IsoFLOP、μP、困惑度、MinHash 去重、DPO、GRPO、ViT patch 等
 - 每章开头嵌入原课视频，正文关键处附时间戳链接，可以跳到对应位置
 - 附录 A 是五个作业的实战路线，附录 B 是 130 条术语表
 

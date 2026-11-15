@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>反向传播单步演示</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#6b7280;--card:#f5f7fa;--border:#d8dee4;--accent:#2563eb;--accent-soft:#dbeafe;--warn:#d97706;--warn-soft:#fef3c7;--good:#059669;--good-soft:#d1fae5;--bad:#dc2626}
+@media (prefers-color-scheme: dark){:root{--bg:#16181d;--fg:#e6e8eb;--muted:#9aa3ae;--card:#1f232a;--border:#363c45;--accent:#60a5fa;--accent-soft:#1e3a5f;--warn:#fbbf24;--warn-soft:#4a3a12;--good:#34d399;--good-soft:#123d30;--bad:#f87171}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+body{padding:12px;overflow-x:hidden}
+h3{margin:0 0 6px;font-size:16px}
+.muted{color:var(--muted);font-size:12.5px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin:8px 0}
+button{font:inherit;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg);cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button:disabled{opacity:.45;cursor:default}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.ctl{display:flex;align-items:center;gap:6px;flex:1 1 150px}
+.ctl input{flex:1;min-width:60px}
+svg{width:100%;height:auto;display:block}
+.node rect{fill:var(--bg);stroke:var(--border);stroke-width:1.5;transition:all .25s}
+.node.on rect{stroke:var(--accent);stroke-width:3;fill:var(--accent-soft)}
+.node.back rect{stroke:var(--warn);stroke-width:3;fill:var(--warn-soft)}
+.node text{fill:var(--fg);font-size:13px;text-anchor:middle}
+.node .val{font-family:ui-monospace,Menlo,monospace;font-weight:700;font-size:15px}
+.node .grad{fill:var(--warn);font-family:ui-monospace,Menlo,monospace;font-size:12.5px;font-weight:700}
+.edge{stroke:var(--muted);stroke-width:1.5;fill:none}
+.edge.back{stroke:var(--warn);stroke-width:2.5;stroke-dasharray:6 4}
+.elabel{fill:var(--warn);font-size:12px;font-family:ui-monospace,Menlo,monospace;text-anchor:middle}
+.steps{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px}
+.steps span{padding:2px 8px;border-radius:12px;font-size:12px;background:var(--bg);border:1px solid var(--border);color:var(--muted)}
+.steps span.cur{background:var(--accent);border-color:var(--accent);color:#fff}
+.steps span.done{color:var(--good);border-color:var(--good)}
+#explain{min-height:88px}
+#explain b{color:var(--accent)}
+.check{background:var(--good-soft);border-radius:6px;padding:4px 8px;margin-top:6px;font-size:13px}
+#hist{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+#hist span{font-size:12px;padding:1px 6px;border-radius:4px;background:var(--bg);border:1px solid var(--border)}
+</style>
+</head>
+<body>
+<h3>反向传播：前向算值，反向传梯度，再拧旋钮</h3>
+<div class="muted">模型只有一个旋钮 w：预测 ŷ = w × x，损失 L = (ŷ − y)²。按“下一步”逐步执行，看数值怎么从左往右流（前向），梯度怎么从右往左传（反向）。</div>
+
+<div class="row">
+  <div class="ctl">x = <input id="ix" type="range" min="-4" max="4" step="0.5" value="2"><span id="vx" class="mono"></span></div>
+  <div class="ctl">y（正确答案） = <input id="iy" type="range" min="-10" max="20" step="1" value="10"><span id="vy" class="mono"></span></div>
+</div>
+<div class="row">
+  <div class="ctl">初始 w = <input id="iw" type="range" min="-3" max="8" step="0.5" value="3"><span id="vw" class="mono"></span></div>
+  <div class="ctl">学习率 = <input id="ilr" type="range" min="0.01" max="0.3" step="0.01" value="0.05"><span id="vlr" class="mono"></span></div>
+</div>
+
+<div class="card">
+  <div class="steps" id="steps"></div>
+  <svg viewBox="0 0 640 210" id="g">
+    <defs>
+      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker>
+    </defs>
+    <path class="edge" d="M120,55 L245,95" style="color:var(--muted)" marker-end="url(#arr)"/>
+    <path class="edge" d="M120,155 L245,115" style="color:var(--muted)" marker-end="url(#arr)"/>
+    <path class="edge" d="M375,105 L475,105" style="color:var(--muted)" marker-end="url(#arr)"/>
+    <path id="b1" class="edge back" d="M475,128 Q425,160 375,128" style="color:var(--warn);opacity:0" marker-end="url(#arr)"/>
+    <path id="b2" class="edge back" d="M245,82 Q180,20 122,40" style="color:var(--warn);opacity:0" marker-end="url(#arr)"/>
+    <text id="b1t" class="elabel" x="425" y="172" style="opacity:0"></text>
+    <text id="b2t" class="elabel" x="185" y="22" style="opacity:0"></text>
+
+    <g class="node" id="nw"><rect x="10" y="25" width="110" height="60" rx="8"/><text x="65" y="47">旋钮 w</text><text class="val" x="65" y="70" id="tw"></text></g>
+    <g class="node" id="nx"><rect x="10" y="125" width="110" height="60" rx="8"/><text x="65" y="147">输入 x</text><text class="val" x="65" y="170" id="tx"></text></g>
+    <g class="node" id="ny"><rect x="245" y="75" width="130" height="60" rx="8"/><text x="310" y="97">预测 ŷ = w·x</text><text class="val" x="310" y="120" id="ty"></text></g>
+    <g class="node" id="nl"><rect x="475" y="75" width="155" height="60" rx="8"/><text x="552" y="97">损失 (ŷ−y)²</text><text class="val" x="552" y="120" id="tl"></text></g>
+    <text class="grad" id="gw" x="65" y="102" text-anchor="middle"></text>
+    <text class="grad" id="gy" x="310" y="152" text-anchor="middle"></text>
+  </svg>
+  <div id="explain"></div>
+  <div class="row">
+    <button class="primary" id="next">下一步 ▶</button>
+    <button id="auto">自动训练 10 轮</button>
+    <button id="reset">重置</button>
+    <span class="muted">轮次 <b id="ep">0</b></span>
+  </div>
+  <div class="muted">损失历史：</div>
+  <div id="hist"></div>
+</div>
+
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const fmt=v=>{const r=Math.round(v*1000)/1000;return (Object.is(r,-0)?0:r).toString();};
+  const STEPS=['① 前向：算预测','② 前向：算损失','③ 反向：∂L/∂ŷ','④ 反向：∂L/∂w','⑤ 更新 w'];
+  let st={}; let timer=null;
+
+  function readInputs(){
+    st={x:+$('ix').value,y:+$('iy').value,w:+$('iw').value,lr:+$('ilr').value,step:0,epoch:0,hist:[]};
+    $('vx').textContent=fmt(st.x);$('vy').textContent=fmt(st.y);$('vw').textContent=fmt(st.w);$('vlr').textContent=fmt(st.lr);
+    render();
+  }
+  function show(id,on){$(id).style.opacity=on?1:0;}
+  function cls(id,c){const el=$(id);el.classList.remove('on','back');if(c)el.classList.add(c);}
+
+  function render(){
+    const s=st;
+    $('steps').innerHTML=STEPS.map((t,i)=>`<span class="${i<s.step?'done':(i===s.step?'cur':'')}">${t}</span>`).join('');
+    $('tw').textContent=fmt(s.w);$('tx').textContent=fmt(s.x);
+    $('ty').textContent=s.step>=1?fmt(s.yhat):'?';
+    $('tl').textContent=s.step>=2?fmt(s.L):'?';
+    $('gy').textContent=s.step>=3?'∂L/∂ŷ = '+fmt(s.dy):'';
+    $('gw').textContent=s.step>=4?'∂L/∂w = '+fmt(s.dw):'';
+    ['nw','nx','ny','nl'].forEach(n=>cls(n,null));
+    show('b1',s.step>=3);show('b1t',s.step>=3);show('b2',s.step>=4);show('b2t',s.step>=4);
+    $('b1t').textContent='× 2(ŷ−y)';$('b2t').textContent='× x = '+fmt(s.x);
+    $('ep').textContent=s.epoch;
+    $('hist').innerHTML=s.hist.map((v,i)=>`<span>第${i+1}轮 L=${fmt(v)}</span>`).join('');
+    const e=$('explain');
+    if(s.step===0){e.innerHTML='准备好了。现在 w = <b>'+fmt(s.w)+'</b>，输入 x = '+fmt(s.x)+'，正确答案 y = '+fmt(s.y)+'。按“下一步”开始前向传播。';}
+  }
+
+  function next(){
+    const s=st,e=$('explain');
+    if(s.step===0){
+      s.yhat=s.w*s.x; s.step=1; render(); cls('nw','on');cls('nx','on');cls('ny','on');
+      e.innerHTML=`<b>前向第一步</b>：预测 ŷ = w × x = ${fmt(s.w)} × ${fmt(s.x)} = <b>${fmt(s.yhat)}</b>。数值从左往右流。`;
+    }else if(s.step===1){
+      s.L=(s.yhat-s.y)**2; s.step=2; render(); cls('ny','on');cls('nl','on');
+      e.innerHTML=`<b>前向第二步</b>：损失 L = (ŷ − y)² = (${fmt(s.yhat)} − ${fmt(s.y)})² = <b>${fmt(s.L)}</b>。预测和答案差 ${fmt(s.yhat-s.y)}，损失就是差值的平方。`;
+    }else if(s.step===2){
+      s.dy=2*(s.yhat-s.y); s.step=3; render(); cls('nl','back');cls('ny','back');
+      const h=0.01, Lp=(s.yhat+h-s.y)**2;
+      e.innerHTML=`<b>反向第一环</b>：ŷ 变一点点，L 变几倍？对 (ŷ − y)² 求导得 2(ŷ − y) = 2 × (${fmt(s.yhat)} − ${fmt(s.y)}) = <b>${fmt(s.dy)}</b>。`+
+        (s.dy<0?' 负数表示“ŷ 变大，损失变小”。':(s.dy>0?' 正数表示“ŷ 变大，损失也变大”。':' 等于 0：已经完全猜中了。'))+
+        `<div class="check">✔ 数值验证：把 ŷ 改成 ${fmt(s.yhat+h)}，损失变成 ${(Lp).toFixed(4)}，变化了 ${(Lp-s.L).toFixed(4)} ≈ ${fmt(s.dy)} × 0.01</div>`;
+    }else if(s.step===3){
+      s.dw=s.dy*s.x; s.step=4; render(); cls('ny','back');cls('nw','back');
+      const h=0.01, Lp=((s.w+h)*s.x-s.y)**2;
+      e.innerHTML=`<b>反向第二环</b>：w 变一点点，ŷ 变几倍？ŷ = w × x，所以是 x = ${fmt(s.x)}。<b>链式法则</b>：两环相乘，∂L/∂w = ${fmt(s.dy)} × ${fmt(s.x)} = <b>${fmt(s.dw)}</b>。注意：这一步要用到前向时的 x，所以前向的中间结果必须保存下来。`+
+        `<div class="check">✔ 数值验证：把 w 改成 ${fmt(s.w+h)}，损失变成 ${(Lp).toFixed(4)}，变化了 ${(Lp-s.L).toFixed(4)} ≈ ${fmt(s.dw)} × 0.01</div>`;
+    }else if(s.step===4){
+      const old=s.w; s.w=old-s.lr*s.dw; s.hist.push(s.L); s.epoch++; s.step=0; render(); cls('nw','on');
+      const nl=(s.w*s.x-s.y)**2;
+      e.innerHTML=`<b>梯度下降</b>：w ← w − 学习率 × 梯度 = ${fmt(old)} − ${fmt(s.lr)} × (${fmt(s.dw)}) = <b>${fmt(s.w)}</b>。`+
+        `新的预测是 ${fmt(s.w*s.x)}，损失从 ${fmt(s.hist[s.hist.length-1])} 变成 ${fmt(nl)}。`+
+        (nl>s.hist[s.hist.length-1]?' <span style="color:var(--bad)">损失反而变大了：学习率太大，一步迈过头了。</span>':'')+' 按“下一步”开始下一轮。';
+    }
+  }
+
+  $('next').onclick=next;
+  $('reset').onclick=()=>{stop();readInputs();};
+  function stop(){if(timer){clearInterval(timer);timer=null;$('auto').textContent='自动训练 10 轮';}}
+  $('auto').onclick=()=>{
+    if(timer){stop();return;}
+    let n=0; $('auto').textContent='停止';
+    timer=setInterval(()=>{ next(); if(st.step===0){n++; if(n>=10||!isFinite(st.w)||Math.abs(st.w)>1e6) stop();} },220);
+  };
+  ['ix','iy','iw','ilr'].forEach(id=>$(id).addEventListener('input',()=>{stop();readInputs();}));
+  readInputs();
+})();
+</script>
+</body>
+</html>

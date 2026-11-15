@@ -5,6 +5,8 @@
 | 演示 | 所在章节 | |
 |---|---|---|
 | 作业路线规划器：按硬件条件看每道题在哪做 | [附录 A 作业实战路线：五个作业怎么做、在哪做、怎么自测](./chapters/appendix-a-assignments) | <a href="./demos/appA-roadmap.html" target="_blank">打开 ↗</a> |
+| 反向传播单步演示：前向算值，反向传梯度 | [第 0 章 预备知识速成](./chapters/ch00-primer) | <a href="./demos/ch00-backprop.html" target="_blank">打开 ↗</a> |
+| 浮点数格式对比：同一个数在 fp32 / fp16 / bf16 里变成什么 | [第 0 章 预备知识速成](./chapters/ch00-primer) | <a href="./demos/ch00-float.html" target="_blank">打开 ↗</a> |
 | 梯度下降：小球滑坡 | [第 0 章 预备知识速成](./chapters/ch00-primer) | <a href="./demos/ch00-gradient-descent.html" target="_blank">打开 ↗</a> |
 | 矩阵乘法：形状规则 + 逐元素计算 | [第 0 章 预备知识速成](./chapters/ch00-primer) | <a href="./demos/ch00-matmul.html" target="_blank">打开 ↗</a> |
 | softmax、温度、交叉熵与困惑度 | [第 0 章 预备知识速成](./chapters/ch00-primer) | <a href="./demos/ch00-softmax.html" target="_blank">打开 ↗</a> |
