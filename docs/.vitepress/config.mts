@@ -1,5 +1,6 @@
 import { defineConfig } from 'vitepress'
 import { withMermaid } from 'vitepress-plugin-mermaid'
+import cjkFriendly from 'markdown-it-cjk-friendly'
 
 const base = process.env.BASE_PATH || '/'
 
@@ -10,7 +11,7 @@ export default withMermaid(defineConfig({
   description: '面向移动端工程师的 Stanford CS336 中文学习笔记',
   cleanUrls: true,
   lastUpdated: true,
-  markdown: { math: true, lineNumbers: false },
+  markdown: { math: true, lineNumbers: false, config: (md) => { md.use(cjkFriendly) } },
   head: [['link', { rel: 'icon', href: `${base}favicon.svg` }]],
   themeConfig: {
     nav: [
