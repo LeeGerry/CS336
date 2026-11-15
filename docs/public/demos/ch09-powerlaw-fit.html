@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>缩放定律拟合与外推</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#656d76;--card:#f6f8fa;--border:#d0d7de;--accent:#2563eb;--accent2:#ea580c;--good:#16a34a;--bad:#dc2626;--grid:#e5e7eb;--pt:#2563eb;--off:#9ca3af}
+@media (prefers-color-scheme: dark){:root{--bg:#1b1b1f;--fg:#e6edf3;--muted:#9aa4af;--card:#24262b;--border:#3a3f47;--accent:#60a5fa;--accent2:#fb923c;--good:#4ade80;--bad:#f87171;--grid:#30363d;--pt:#60a5fa;--off:#6b7280}}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+h3{margin:0 0 6px;font-size:16px}
+.muted{color:var(--muted);font-size:12.5px}
+.controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px 16px;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin:8px 0}
+.controls label{display:block;font-size:13px}.controls label input[type=range],.controls label select{display:block;width:100%;margin-top:2px}
+.controls input[type=range]{width:100%}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+button{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px}
+button.sec{background:transparent;color:var(--fg);border:1px solid var(--border)}
+svg{width:100%;height:auto;display:block;background:var(--bg)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:8px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:8px}
+.stat b{display:block;font-size:17px}
+.bad{color:var(--bad)}.good{color:var(--good)}
+select{background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:4px}
+</style>
+</head>
+<body>
+<h3>在小模型上拟合直线，外推到大模型</h3>
+<div class="muted">真实规律（你看不到）：L(C) = E + K·(C / 1e17)<sup>−α</sup>。左侧蓝点是"小规模实验"，点击某个点可以把它排除/加入拟合。橙色星号是外推出的预测，黑圈是 1e23 FLOPs 大训练的真实损失。</div>
+<div class="controls">
+  <label>小规模实验点数：<span id="nV"></span><input id="n" type="range" min="3" max="12" step="1" value="6"></label>
+  <label>实验覆盖到的最大算力：10^<span id="xmaxV"></span><input id="xmax" type="range" min="18" max="21" step="0.25" value="19.5"></label>
+  <label>测量噪声（每个点的相对误差）：<span id="noiseV"></span><input id="noise" type="range" min="0" max="0.08" step="0.005" value="0.015"></label>
+  <label>不可约损失 E（渐近线）：<span id="EV"></span><input id="E" type="range" min="0" max="2.2" step="0.05" value="1.7"></label>
+  <label>真实指数 α：<span id="aV"></span><input id="a" type="range" min="0.05" max="0.4" step="0.01" value="0.15"></label>
+  <label>拟合方式
+    <select id="mode">
+      <option value="pure">纯幂律：log L 对 log C 拟合直线</option>
+      <option value="floor">带渐近线：L = E + K·C^(-α)（同时拟合 E）</option>
+    </select>
+  </label>
+</div>
+<div class="row"><button id="resample">重新采样噪声</button><button class="sec" id="allon">全部点参与拟合</button><span class="muted">提示：把噪声调大、点数调少，多点几次"重新采样"，看外推结果有多不稳定。</span></div>
+<svg id="plot" viewBox="0 0 680 400"></svg>
+<div class="stats">
+  <div class="stat"><span class="muted">拟合得到的斜率</span><b id="slope">-</b></div>
+  <div class="stat"><span class="muted">在 10^23 的预测损失</span><b id="pred">-</b></div>
+  <div class="stat"><span class="muted">真实损失</span><b id="truth">-</b></div>
+  <div class="stat"><span class="muted">外推误差</span><b id="err">-</b></div>
+</div>
+<p class="muted" id="note"></p>
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const svg=$('plot');
+  const W=680,H=400,ml=58,mr=16,mt=14,mb=44;
+  const X0=17,X1=23.4; // log10 C
+  let seeds=[]; let excluded=new Set();
+  function randn(){let u=0,v=0;while(!u)u=Math.random();while(!v)v=Math.random();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);}
+  function resample(){seeds=[];for(let i=0;i<20;i++)seeds.push(randn());}
+  const K=2.5;
+  function trueL(lc){const E=+$('E').value,a=+$('a').value;return E+K*Math.pow(10,-(lc-17)*a);}
+  function linfit(xs,ys){const n=xs.length;let mx=0,my=0;for(let i=0;i<n;i++){mx+=xs[i];my+=ys[i];}mx/=n;my/=n;let sxy=0,sxx=0;for(let i=0;i<n;i++){sxy+=(xs[i]-mx)*(ys[i]-my);sxx+=(xs[i]-mx)**2;}const b=sxx>0?sxy/sxx:0;return {b,a:my-b*mx};}
+  function getPoints(){
+    const n=+$('n').value,xm=+$('xmax').value,noise=+$('noise').value;
+    const pts=[];
+    for(let i=0;i<n;i++){const lc=17+(xm-17)*(n===1?0:i/(n-1));const L=trueL(lc)*Math.exp(noise*seeds[i]);pts.push({lc,L,i,on:!excluded.has(i)});}
+    return pts;
+  }
+  function fit(pts){
+    const used=pts.filter(p=>p.on);
+    if(used.length<2)return null;
+    const mode=$('mode').value;
+    const xs=used.map(p=>p.lc);
+    if(mode==='pure'){
+      const f=linfit(xs,used.map(p=>Math.log10(p.L)));
+      return {E:0,slope:f.b,pred:lc=>Math.pow(10,f.a+f.b*lc)};
+    }
+    // grid search over E, fit log(L-E) linear, minimize SSE in log L
+    const minL=Math.min(...used.map(p=>p.L));
+    let best=null;
+    for(let k=0;k<=400;k++){
+      const E=(minL-1e-3)*k/400;
+      const f=linfit(xs,used.map(p=>Math.log10(p.L-E)));
+      if(f.b>0)continue;
+      let sse=0;for(const p of used){const ph=E+Math.pow(10,f.a+f.b*p.lc);sse+=(Math.log(ph)-Math.log(p.L))**2;}
+      if(!best||sse<best.sse)best={sse,E,f};
+    }
+    if(!best)return null;
+    const {E,f}=best;
+    return {E,slope:f.b,pred:lc=>E+Math.pow(10,f.a+f.b*lc)};
+  }
+  function draw(){
+    $('nV').textContent=$('n').value;$('xmaxV').textContent=(+$('xmax').value).toFixed(2);
+    $('noiseV').textContent=(+$('noise').value*100).toFixed(1)+'%';$('EV').textContent=(+$('E').value).toFixed(2);$('aV').textContent=(+$('a').value).toFixed(2);
+    const pts=getPoints();
+    const F=fit(pts);
+    const target=23;
+    const yT=trueL(target);
+    const yP=F?F.pred(target):NaN;
+    // y range (log10 L)
+    let ys=pts.map(p=>p.L).concat([yT, trueL(17)]); if(isFinite(yP)&&yP>0)ys.push(yP);
+    let Y0=Math.log10(Math.min(...ys)*0.85),Y1=Math.log10(Math.max(...ys)*1.12);
+    const sx=lc=>ml+(lc-X0)/(X1-X0)*(W-ml-mr);
+    const sy=ly=>mt+(1-(ly-Y0)/(Y1-Y0))*(H-mt-mb);
+    let s='';
+    // grid
+    for(let lc=17;lc<=23;lc++){s+=`<line x1="${sx(lc)}" y1="${mt}" x2="${sx(lc)}" y2="${H-mb}" stroke="var(--grid)"/><text x="${sx(lc)}" y="${H-mb+16}" font-size="11" text-anchor="middle" fill="var(--muted)">1e${lc}</text>`;}
+    const ticks=[0.5,0.7,1,1.5,2,2.5,3,4,5,6,8,10,15];
+    for(const t of ticks){const ly=Math.log10(t);if(ly<Y0||ly>Y1)continue;s+=`<line x1="${ml}" y1="${sy(ly)}" x2="${W-mr}" y2="${sy(ly)}" stroke="var(--grid)"/><text x="${ml-6}" y="${sy(ly)+4}" font-size="11" text-anchor="end" fill="var(--muted)">${t}</text>`;}
+    s+=`<text x="${(ml+W-mr)/2}" y="${H-6}" font-size="12" text-anchor="middle" fill="var(--muted)">训练算力 C（FLOPs，对数坐标）</text>`;
+    s+=`<text x="14" y="${(mt+H-mb)/2}" font-size="12" text-anchor="middle" fill="var(--muted)" transform="rotate(-90 14 ${(mt+H-mb)/2})">测试损失 L（对数坐标）</text>`;
+    // shaded experiment region
+    const xm=+$('xmax').value;
+    s+=`<rect x="${sx(17)}" y="${mt}" width="${sx(xm)-sx(17)}" height="${H-mt-mb}" fill="var(--accent)" opacity="0.06"/>`;
+    s+=`<text x="${sx(17)+4}" y="${mt+14}" font-size="11" fill="var(--muted)">小规模实验区</text>`;
+    // E asymptote
+    const E=+$('E').value;
+    if(E>0&&Math.log10(E)>Y0){s+=`<line x1="${ml}" x2="${W-mr}" y1="${sy(Math.log10(E))}" y2="${sy(Math.log10(E))}" stroke="var(--muted)" stroke-dasharray="2 4"/><text x="${W-mr-4}" y="${sy(Math.log10(E))-4}" font-size="11" text-anchor="end" fill="var(--muted)">不可约损失 E=${E.toFixed(2)}</text>`;}
+    // true curve
+    let d='';for(let lc=X0;lc<=X1+1e-9;lc+=0.05){d+=(d?'L':'M')+sx(lc).toFixed(1)+','+sy(Math.log10(trueL(lc))).toFixed(1);}
+    s+=`<path d="${d}" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="6 4"/>`;
+    // fit curve
+    if(F){let d2='';for(let lc=X0;lc<=X1+1e-9;lc+=0.05){const v=F.pred(lc);if(v>0)d2+=(d2?'L':'M')+sx(lc).toFixed(1)+','+sy(Math.log10(v)).toFixed(1);}s+=`<path d="${d2}" fill="none" stroke="var(--accent2)" stroke-width="2.2"/>`;}
+    // points
+    for(const p of pts){s+=`<circle data-i="${p.i}" cx="${sx(p.lc)}" cy="${sy(Math.log10(p.L))}" r="7" fill="${p.on?'var(--pt)':'none'}" stroke="${p.on?'var(--pt)':'var(--off)'}" stroke-width="2" style="cursor:pointer"/>`;}
+    // target
+    s+=`<line x1="${sx(target)}" x2="${sx(target)}" y1="${mt}" y2="${H-mb}" stroke="var(--accent2)" stroke-dasharray="3 3" opacity="0.6"/>`;
+    s+=`<circle cx="${sx(target)}" cy="${sy(Math.log10(yT))}" r="6" fill="none" stroke="var(--fg)" stroke-width="2"/>`;
+    if(F&&yP>0){s+=`<text x="${sx(target)}" y="${sy(Math.log10(yP))+5}" font-size="18" text-anchor="middle" fill="var(--accent2)">★</text>`;}
+    // legend
+    s+=`<g font-size="11" fill="var(--fg)"><line x1="${W-200}" x2="${W-176}" y1="${mt+12}" y2="${mt+12}" stroke="var(--muted)" stroke-dasharray="6 4" stroke-width="1.5"/><text x="${W-170}" y="${mt+16}">真实曲线（未知）</text>
+    <line x1="${W-200}" x2="${W-176}" y1="${mt+30}" y2="${mt+30}" stroke="var(--accent2)" stroke-width="2.2"/><text x="${W-170}" y="${mt+34}">你的拟合 + 外推</text>
+    <circle cx="${W-188}" cy="${mt+48}" r="5" fill="none" stroke="var(--fg)" stroke-width="2"/><text x="${W-170}" y="${mt+52}">10^23 处的真实值</text></g>`;
+    svg.innerHTML=s;
+    svg.querySelectorAll('circle[data-i]').forEach(c=>c.addEventListener('click',()=>{const i=+c.dataset.i;excluded.has(i)?excluded.delete(i):excluded.add(i);draw();}));
+    // stats
+    if(F){
+      $('slope').textContent=$('mode').value==='pure'?F.slope.toFixed(3):`α≈${(-F.slope).toFixed(3)}，E≈${F.E.toFixed(2)}`;
+      $('pred').textContent=yP.toFixed(3);
+      const rel=(yP-yT)/yT*100;
+      $('err').innerHTML=`<span class="${Math.abs(rel)<2?'good':'bad'}">${rel>0?'+':''}${rel.toFixed(1)}%</span>`;
+    } else {$('slope').textContent='至少需要 2 个点';$('pred').textContent='-';$('err').textContent='-';}
+    $('truth').textContent=yT.toFixed(3);
+    const mode=$('mode').value;
+    let note='';
+    if(mode==='pure'&&E>0.5) note='注意：真实曲线有渐近线 E，越往右越"弯"。纯直线拟合在小算力区看着很直，外推到 10^23 却会低估损失（预测过于乐观）。试试切换到"带渐近线"的拟合，或把 E 调成 0。';
+    else if(mode==='floor') note='带渐近线的拟合多了一个自由参数 E：点少或噪声大时，E 会被估得很不准，外推也随之摇摆——这就是"更灵活的函数形式需要更多、更干净的数据"。';
+    else note='E 接近 0 时，真实规律几乎就是一条直线，纯幂律拟合效果很好。';
+    $('note').textContent=note;
+  }
+  ['n','xmax','noise','E','a','mode'].forEach(id=>$(id).addEventListener('input',draw));
+  $('resample').onclick=()=>{resample();draw();};
+  $('allon').onclick=()=>{excluded.clear();draw();};
+  $('n').addEventListener('input',()=>excluded.clear());
+  resample();draw();
+})();
+</script>
+</body>
+</html>

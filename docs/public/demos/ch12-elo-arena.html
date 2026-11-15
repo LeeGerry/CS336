@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>竞技场 Elo 排名模拟</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#656d76;--card:#f6f8fa;--border:#d0d7de;--accent:#2563eb;--accent2:#ea580c;--good:#16a34a;--bad:#dc2626;--grid:#e5e7eb}
+@media (prefers-color-scheme: dark){:root{--bg:#1b1b1f;--fg:#e6edf3;--muted:#9aa4af;--card:#24262b;--border:#3a3f47;--accent:#60a5fa;--accent2:#fb923c;--good:#4ade80;--bad:#f87171;--grid:#30363d}}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+h3{margin:0 0 4px;font-size:16px}
+.muted{color:var(--muted);font-size:12.5px}
+.controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px 16px;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin:8px 0}
+.controls label{display:block;font-size:13px}.controls label input[type=range],.controls label select{display:block;width:100%;margin-top:2px}
+input[type=range]{width:100%}
+.row{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0}
+button{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px}
+button.sec{background:transparent;color:var(--fg);border:1px solid var(--border)}
+svg{width:100%;height:auto;display:block}
+.log{font-family:ui-monospace,Menlo,monospace;font-size:12px;background:var(--card);border:1px solid var(--border);border-radius:6px;padding:6px;min-height:44px;max-height:90px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+.good{color:var(--good)}.bad{color:var(--bad)}
+</style>
+</head>
+<body>
+<h3>Chatbot Arena 式排名：从稀疏的两两投票里拟合 Elo 分数</h3>
+<div class="muted">5 个模型各有一个"真实实力"（Elo，空心框）。每场对战随机挑两个模型，用户投票选更好的那个。胜率模型：P(A 胜 B) = 1 / (1 + 10<sup>(R_B − R_A)/400</sup>)。我们只看到投票结果，用最大似然反推出每个模型的分数（实心条）。</div>
+<div class="controls">
+  <label>评委的"长度偏好"：给话痨模型额外 +<span id="bV"></span> 分印象分（影响之后的对战）<input id="bias" type="range" min="0" max="200" step="10" value="0"></label>
+  <label>本场对战抽样方式
+    <select id="samp" style="background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:4px">
+      <option value="uni">所有组合均匀抽样</option>
+      <option value="sparse">稀疏：只在"相邻实力"的模型间对战</option>
+    </select>
+  </label>
+</div>
+<div class="row">
+  <button id="b20">+20 场</button><button id="b200">+200 场</button><button id="b2000">+2000 场</button><button class="sec" id="reset">清空重来</button>
+  <span class="muted" id="cnt"></span>
+</div>
+<svg id="plot" viewBox="0 0 680 250"></svg>
+<div class="muted">最近几场投票：</div>
+<div class="log" id="log"></div>
+<p class="muted" id="note"></p>
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const M=[{name:'模型 A',r:1250},{name:'模型 B',r:1200},{name:'话痨模型 C',r:1150,verbose:true},{name:'模型 D',r:1100},{name:'模型 E',r:1000}];
+  const K=M.length;
+  let wins,games,total,logs;
+  function reset(){wins=Array.from({length:K},()=>Array(K).fill(0));games=Array.from({length:K},()=>Array(K).fill(0));total=0;logs=[];}
+  function pick(){
+    if($('samp').value==='sparse'){const i=Math.floor(Math.random()*(K-1));return [i,i+1];}
+    let i=Math.floor(Math.random()*K),j;do{j=Math.floor(Math.random()*K);}while(j===i);return [i,j];
+  }
+  function play(n){
+    const b=+$('bias').value;
+    for(let t=0;t<n;t++){
+      const [i,j]=pick();
+      const ri=M[i].r+(M[i].verbose?b:0),rj=M[j].r+(M[j].verbose?b:0);
+      const p=1/(1+Math.pow(10,(rj-ri)/400));
+      const iw=Math.random()<p;
+      const w=iw?i:j,l=iw?j:i;
+      wins[w][l]++;games[i][j]++;games[j][i]++;total++;
+      if(n<=20||t>=n-6)logs.push(`${M[i].name} vs ${M[j].name} → 投给 ${M[w].name}`);
+    }
+    logs=logs.slice(-6);
+  }
+  // Bradley-Terry MLE via MM algorithm
+  function fit(){
+    let g=Array(K).fill(1);
+    const W=wins.map(r=>r.reduce((a,b)=>a+b,0));
+    for(let it=0;it<500;it++){
+      const ng=g.map((gi,i)=>{let den=0;for(let j=0;j<K;j++)if(j!==i&&games[i][j]>0)den+=games[i][j]/(gi+g[j]);return den>0?(W[i]+0.5)/den:gi;});
+      const gm=Math.exp(ng.reduce((a,b)=>a+Math.log(b),0)/K);g=ng.map(x=>x/gm);
+    }
+    const meanTrue=M.reduce((a,m)=>a+m.r,0)/K;
+    return g.map(x=>meanTrue+400*Math.log10(x));
+  }
+  function draw(){
+    $('bV').textContent=$('bias').value;
+    $('cnt').textContent=`已进行 ${total} 场投票`;
+    const W=680,H=250,ml=110,mr=20,mt=10,mb=30;
+    const X0=850,X1=1450;
+    const sx=x=>ml+(Math.min(Math.max(x,X0),X1)-X0)/(X1-X0)*(W-ml-mr);
+    let s='';
+    for(let x=900;x<=1400;x+=100){s+=`<line x1="${sx(x)}" x2="${sx(x)}" y1="${mt}" y2="${H-mb}" stroke="var(--grid)"/><text x="${sx(x)}" y="${H-mb+14}" font-size="10" text-anchor="middle" fill="var(--muted)">${x}</text>`;}
+    s+=`<text x="${W-mr}" y="${H-2}" font-size="10" text-anchor="end" fill="var(--muted)">Elo 分数</text>`;
+    const est=total>0?fit():null;
+    const rh=(H-mt-mb)/K;
+    // ranks
+    let estRank=null;
+    if(est){const idx=[...Array(K).keys()].sort((a,b)=>est[b]-est[a]);estRank=Array(K);idx.forEach((k,r)=>estRank[k]=r+1);}
+    M.forEach((m,i)=>{
+      const y=mt+i*rh+rh*0.2,h=rh*0.6;
+      s+=`<text x="${ml-8}" y="${y+h/2+4}" font-size="12" text-anchor="end" fill="var(--fg)">${m.name}</text>`;
+      if(est){
+        const wrong=estRank[i]!==i+1;
+        s+=`<rect x="${sx(X0)}" y="${y}" width="${sx(est[i])-sx(X0)}" height="${h}" fill="${wrong?'var(--bad)':'var(--accent)'}" opacity="0.75" rx="3"/>`;
+        s+=`<text x="${sx(est[i])+4}" y="${y+h/2+4}" font-size="11" fill="var(--fg)">${Math.round(est[i])}（第 ${estRank[i]} 名）</text>`;
+      }
+      s+=`<rect x="${sx(m.r)-2}" y="${y-3}" width="4" height="${h+6}" fill="none" stroke="var(--fg)" stroke-width="1.5"/>`;
+    });
+    $('plot').innerHTML=s;
+    $('log').textContent=logs.join('\n');
+    let note='黑色竖框 = 真实实力；条形 = 根据投票拟合出的分数（红色表示名次排错了）。';
+    if(total<100) note+=' 投票还很少，估计值抖动很大——多点几次"+200 场"看它如何收敛。';
+    if(+$('bias').value>=80) note+=' 评委偏爱长回答时，话痨模型 C 的分数被系统性抬高，票再多也纠正不了——这不是噪声，而是<b>偏差</b>。AlpacaEval 曾因此被"刷榜"，后来用回归方法做了长度去偏。';
+    if($('samp').value==='sparse') note+=' 稀疏抽样：A 从没和 E 直接对战，但只要对战关系"连通"，Elo 仍能给出全局排名——这正是竞技场不需要每个人评测所有模型的原因。';
+    $('note').innerHTML=note;
+  }
+  $('b20').onclick=()=>{play(20);draw();};
+  $('b200').onclick=()=>{play(200);draw();};
+  $('b2000').onclick=()=>{play(2000);draw();};
+  $('reset').onclick=()=>{reset();draw();};
+  $('bias').addEventListener('input',draw);
+  $('samp').addEventListener('input',draw);
+  reset();play(200);draw();
+})();
+</script>
+</body>
+</html>

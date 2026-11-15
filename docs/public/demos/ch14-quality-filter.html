@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>质量分类器过滤</title>
+<style>
+:root{
+  --bg:#ffffff; --fg:#1f2328; --muted:#656d76; --card:#f6f8fa; --border:#d0d7de;
+  --accent:#3b6fd8; --ok:#2e7d32; --bad:#d1495b; --warn:#b26a00; --grid:#e6e9ed;
+  --pos:rgba(46,125,50,.22); --neg:rgba(209,73,91,.22);
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#16181d; --fg:#e6e8eb; --muted:#9aa4b2; --card:#20242b; --border:#363c46;
+    --accent:#7aa2ff; --ok:#6fd17a; --bad:#ff7a85; --warn:#f0b357; --grid:#2a2f37;
+    --pos:rgba(111,209,122,.25); --neg:rgba(255,122,133,.25);
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+h1{font-size:16px;margin:0 0 8px}
+h2{font-size:14px;margin:14px 0 6px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin:6px 0}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px}
+label{color:var(--muted)}
+button{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 8px;cursor:pointer}
+button.on{border-color:var(--accent);color:var(--accent);font-weight:600}
+textarea{width:100%;font:inherit;font-size:13px;color:var(--fg);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px;min-height:60px;resize:vertical}
+input[type=range]{width:100%}
+.small{font-size:12px;color:var(--muted)}
+.ex{font-size:12px;margin:2px 0;padding:2px 6px;border-radius:4px;background:var(--bg);border:1px solid var(--border)}
+.w{display:flex;align-items:center;gap:6px;font-size:12px;margin:1px 0}
+.w .nm{width:90px;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.w .bar{height:10px;border-radius:2px}
+.doc{display:flex;gap:8px;align-items:flex-start;padding:4px 0;border-bottom:1px solid var(--border);font-size:13px}
+.doc .sc{min-width:52px;font-weight:700;text-align:right}
+.doc.drop{opacity:.45}
+.doc .txt{flex:1;word-break:break-word}
+.tag{display:inline-block;padding:0 6px;border-radius:999px;font-size:11px;font-weight:700;color:#fff;white-space:nowrap}
+.tag.ok{background:var(--ok)} .tag.bad{background:var(--bad)}
+.tok{border-radius:3px;padding:0 1px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}
+.stat b{display:block;font-size:18px}
+canvas{width:100%;display:block;border-radius:8px;background:var(--card);border:1px solid var(--border)}
+</style>
+</head>
+<body>
+<h1>质量过滤：用“目标数据 T”训练一个便宜的分类器，再去筛“原始数据 R”</h1>
+<div class="small">这是一个极简的词袋线性分类器（fastText 的思想：每个词一个权重，加起来过 sigmoid）。正例 T 像维基/问答，负例取自原始网页 R。</div>
+
+<div class="grid2">
+  <div class="card"><b>正例 T（“好数据长这样”）</b><div id="posList"></div></div>
+  <div class="card"><b>负例（随机原始网页）</b><div id="negList"></div></div>
+</div>
+
+<h2>① 训练得到的词权重（log 几率，>0 偏向“高质量”）</h2>
+<div class="card grid2">
+  <div><div class="small">最“高质量”的词</div><div id="wPos"></div></div>
+  <div><div class="small">最“低质量”的词</div><div id="wNeg"></div></div>
+</div>
+
+<h2>② 给原始池 R 打分并筛选</h2>
+<div class="card">
+  <div class="row">
+    <button id="mHard" class="on">硬阈值：score ≥ τ 才保留</button>
+    <button id="mPareto">GPT-3 式随机保留：pareto(9) &gt; 1 − score</button>
+    <button id="resample" style="display:none">重新抽样</button>
+  </div>
+  <div id="thrBox"><label>阈值 τ：<b id="tV"></b></label><input id="t" type="range" min="0.05" max="0.95" step="0.01" value="0.5"></div>
+  <div class="stats">
+    <div class="card stat"><span class="small">保留篇数</span><b id="kept"></b></div>
+    <div class="card stat"><span class="small">保留比例</span><b id="frac"></b></div>
+    <div class="card stat"><span class="small">保留里“其实是垃圾”的</span><b id="fp"></b></div>
+    <div class="card stat"><span class="small">被扔掉的“其实不错”的</span><b id="fn"></b></div>
+  </div>
+  <canvas id="hist" height="120"></canvas>
+  <div class="small">直方图：每篇文档的分数（绿=人工认为不错，红=人工认为垃圾；人工标注仅用于统计误差，分类器看不到）。</div>
+  <div id="pool"></div>
+</div>
+
+<h2>③ 自己写一段，看看每个词把分数往哪边推</h2>
+<div class="card">
+  <textarea id="mine">The theorem states that every continuous function on a closed interval attains a maximum. Click here to subscribe for free!!!</textarea>
+  <div id="mineOut" style="margin-top:6px"></div>
+</div>
+
+<script>
+(function(){
+const POS = [
+  "The mitochondrion is an organelle found in most cells, where it produces energy through respiration.",
+  "In mathematics, a prime number is a natural number greater than one that has no divisors other than one and itself.",
+  "Why is the sky blue? Sunlight is scattered by molecules in the atmosphere, and shorter wavelengths scatter more.",
+  "The French Revolution began in 1789 and led to major political and social changes across Europe.",
+  "Photosynthesis converts light energy into chemical energy, which is stored in glucose molecules.",
+  "A binary search algorithm finds the position of a target value within a sorted array by halving the interval.",
+  "The river flows through the valley and provides water for farms and cities along its banks.",
+  "Explain like I'm five: vaccines teach the immune system to recognize a virus before an infection happens."
+];
+const NEG = [
+  "Click here to win a free iPhone!!! Limited offer, buy now, best price, free shipping.",
+  "Home | About | Contact | Login | Sign up | Privacy Policy | Terms of Use",
+  "Cheap viagra cheap pills best deal buy now online pharmacy discount discount",
+  "Copyright 2024 all rights reserved. Powered by WordPress. Cookie settings.",
+  "lol omg this is sooo good click the link in my bio for more free stuff",
+  "Hot singles in your area! Click now, free sign up, no credit card required.",
+  "Page not found. The page you are looking for does not exist. Return to home.",
+  "best best best deals deals deals buy buy now now free free free"
+];
+// raw pool R: [text, human label 1=good 0=bad]
+const POOL = [
+  ["The heart is a muscular organ that pumps blood through the body via the circulatory system.",1],
+  ["Buy cheap watches online, best price guaranteed, free shipping, click here now!",0],
+  ["Newton's laws of motion describe the relationship between a body and the forces acting upon it.",1],
+  ["Login | Register | Forgot password | Help | Contact us",0],
+  ["My grandmother taught me how to bake bread; the secret is letting the dough rest overnight.",1],
+  ["Free free free!!! Win money now, click the link, limited time offer.",0],
+  ["A hash table stores key value pairs and offers fast lookup by computing an index from the key.",1],
+  ["Cookie policy: we use cookies to improve your experience. Accept all cookies.",0],
+  ["The Roman Empire was one of the largest empires in history, spanning Europe, Africa and Asia.",1],
+  ["omg lol so cute click my profile for more pics",0],
+  ["To solve a quadratic equation, you can complete the square or use the quadratic formula.",1],
+  ["Sale sale sale best deals on shoes buy now discount discount",0],
+  ["Q: How do plants absorb water? A: Through their roots, by osmosis, and water moves up the stem.",1],
+  ["Page 2 of 57 | Next | Previous | Sort by price | Filter results",0],
+  ["Our team won the local football match last weekend and we celebrated at the park.",1],
+  ["Error 404: the requested resource could not be found on this server.",0],
+  ["The best online casino in the world offers the largest bonus and the most exciting games for all players in the region.",0],
+  ["lol ok so my bike chain kept slipping, fix: flip it, loosen the rear wheel, pull it back, tighten. works now!!",1]
+];
+
+const tokenize = s => (s.toLowerCase().match(/[a-z0-9']+|!+/g) || []);
+// train: smoothed log-odds per word (a naive-Bayes-flavoured linear model)
+const cnt = {pos:{}, neg:{}}; let totP = 0, totN = 0;
+POS.forEach(s=>tokenize(s).forEach(w=>{ cnt.pos[w] = (cnt.pos[w]||0) + 1; totP++; }));
+NEG.forEach(s=>tokenize(s).forEach(w=>{ cnt.neg[w] = (cnt.neg[w]||0) + 1; totN++; }));
+const vocab = new Set([...Object.keys(cnt.pos), ...Object.keys(cnt.neg)]);
+const V = vocab.size, alpha = 1;
+const W = {};
+vocab.forEach(w=>{
+  const pp = ((cnt.pos[w]||0) + alpha) / (totP + alpha*V);
+  const pn = ((cnt.neg[w]||0) + alpha) / (totN + alpha*V);
+  W[w] = Math.log(pp / pn);
+});
+const sigmoid = z => 1 / (1 + Math.exp(-z));
+function score(text){
+  const toks = tokenize(text);
+  if (!toks.length) return {p:0.5, toks:[]};
+  let z = 0; const detail = [];
+  toks.forEach(t=>{ const w = W[t] || 0; z += w; detail.push([t, w]); });
+  // average so length doesn't dominate, then scale (like a temperature)
+  return {p: sigmoid(2.2 * z / Math.sqrt(toks.length)), toks: detail};
+}
+
+function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+document.getElementById('posList').innerHTML = POS.map(s=>'<div class="ex">' + esc(s) + '</div>').join('');
+document.getElementById('negList').innerHTML = NEG.map(s=>'<div class="ex">' + esc(s) + '</div>').join('');
+
+const sorted = Object.entries(W).filter(([w])=>(cnt.pos[w]||0)+(cnt.neg[w]||0) >= 2).sort((a,b)=>b[1]-a[1]);
+const maxAbs = Math.max(...sorted.map(e=>Math.abs(e[1])));
+function wrow(w, v){
+  const col = v > 0 ? 'var(--ok)' : 'var(--bad)';
+  return '<div class="w"><span class="nm">' + esc(w) + '</span><span class="bar" style="width:' + (Math.abs(v)/maxAbs*130).toFixed(0) + 'px;background:' + col + '"></span><span class="small">' + v.toFixed(2) + '</span></div>';
+}
+document.getElementById('wPos').innerHTML = sorted.slice(0,8).map(e=>wrow(e[0], e[1])).join('');
+document.getElementById('wNeg').innerHTML = sorted.slice(-8).reverse().map(e=>wrow(e[0], e[1])).join('');
+
+let mode = 'hard';
+let draws = POOL.map(()=>Math.random());
+// numpy's pareto(a) is the Lomax distribution: (1-U)^(-1/a) - 1
+const pareto = (u, a) => Math.pow(1 - u, -1/a) - 1;
+const scores = POOL.map(([t])=>score(t).p);
+
+function render(){
+  const tau = +document.getElementById('t').value;
+  document.getElementById('tV').textContent = tau.toFixed(2);
+  let kept = 0, fp = 0, fn = 0;
+  const order = POOL.map((d,i)=>i).sort((a,b)=>scores[b]-scores[a]);
+  let html = '';
+  order.forEach(i=>{
+    const [t, lab] = POOL[i], s = scores[i];
+    const keep = mode === 'hard' ? s >= tau : pareto(draws[i], 9) > 1 - s;
+    if (keep){ kept++; if (!lab) fp++; } else if (lab) fn++;
+    html += '<div class="doc' + (keep?'':' drop') + '"><span class="sc" style="color:' + (s>=0.5?'var(--ok)':'var(--bad)') + '">' + s.toFixed(2) + '</span>' +
+      '<span class="txt">' + esc(t) + '</span>' + (keep ? '<span class="tag ok">保留</span>' : '<span class="tag bad">丢弃</span>') + '</div>';
+  });
+  document.getElementById('pool').innerHTML = html;
+  document.getElementById('kept').textContent = kept + ' / ' + POOL.length;
+  document.getElementById('frac').textContent = (kept/POOL.length*100).toFixed(0) + '%';
+  document.getElementById('fp').textContent = fp;
+  document.getElementById('fn').textContent = fn;
+  drawHist(tau);
+}
+function drawHist(tau){
+  const cv = document.getElementById('hist');
+  const dpr = window.devicePixelRatio || 1, Wd = cv.clientWidth, H = 120;
+  cv.width = Wd*dpr; cv.height = H*dpr;
+  const ctx = cv.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0);
+  const cs = getComputedStyle(document.documentElement);
+  const ok = cs.getPropertyValue('--ok').trim(), bad = cs.getPropertyValue('--bad').trim();
+  const muted = cs.getPropertyValue('--muted').trim(), acc = cs.getPropertyValue('--accent').trim();
+  ctx.clearRect(0,0,Wd,H);
+  const L = 10, R = 10, bins = 20, bw = (Wd-L-R)/bins;
+  const stack = Array.from({length:bins}, ()=>[]);
+  POOL.forEach(([t,lab],i)=>{ const k = Math.min(bins-1, Math.floor(scores[i]*bins)); stack[k].push(lab); });
+  stack.forEach((arr,k)=>{ arr.forEach((lab,j)=>{ ctx.fillStyle = lab ? ok : bad; ctx.fillRect(L + k*bw + 1, H - 22 - (j+1)*16, bw - 2, 14); }); });
+  ctx.fillStyle = muted; ctx.font = '11px sans-serif';
+  [0,0.25,0.5,0.75,1].forEach(v=>ctx.fillText(v.toString(), L + v*(Wd-L-R) - 6, H - 6));
+  if (mode === 'hard'){
+    ctx.strokeStyle = acc; ctx.lineWidth = 2; ctx.setLineDash([4,3]);
+    const x = L + tau*(Wd-L-R); ctx.beginPath(); ctx.moveTo(x, 4); ctx.lineTo(x, H - 20); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = acc; ctx.fillText('τ', x + 3, 14);
+  }
+}
+function renderMine(){
+  const {p, toks} = score(document.getElementById('mine').value);
+  let html = '<div>分数：<b style="color:' + (p>=0.5?'var(--ok)':'var(--bad)') + '">' + p.toFixed(3) + '</b> <span class="small">（没在训练集出现过的词权重为 0，不起作用——这就是“泛化”受限的地方）</span></div><div style="margin-top:4px;line-height:1.9">';
+  toks.forEach(([t,w])=>{
+    const bg = w > 0.05 ? 'var(--pos)' : (w < -0.05 ? 'var(--neg)' : 'transparent');
+    html += '<span class="tok" title="' + w.toFixed(2) + '" style="background:' + bg + '">' + esc(t) + '</span> ';
+  });
+  document.getElementById('mineOut').innerHTML = html + '</div>';
+}
+document.getElementById('t').addEventListener('input', render);
+document.getElementById('mine').addEventListener('input', renderMine);
+document.getElementById('mHard').onclick = ()=>{ mode='hard'; document.getElementById('mHard').classList.add('on'); document.getElementById('mPareto').classList.remove('on'); document.getElementById('thrBox').style.display=''; document.getElementById('resample').style.display='none'; render(); };
+document.getElementById('mPareto').onclick = ()=>{ mode='pareto'; document.getElementById('mPareto').classList.add('on'); document.getElementById('mHard').classList.remove('on'); document.getElementById('thrBox').style.display='none'; document.getElementById('resample').style.display=''; render(); };
+document.getElementById('resample').onclick = ()=>{ draws = POOL.map(()=>Math.random()); render(); };
+window.addEventListener('resize', ()=>render());
+if (window.matchMedia) window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', ()=>render());
+render(); renderMine();
+})();
+</script>
+</body>
+</html>

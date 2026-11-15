@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>注意力成本对比</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#656d76;--card:#f6f8fa;--border:#d0d7de;--grid:#e1e4e8;--c1:#cf222e;--c2:#0969da;--c3:#1a7f37;--c4:#8250df;--c5:#9a6700;}
+@media (prefers-color-scheme: dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8d96a0;--card:#161b22;--border:#30363d;--grid:#262c33;--c1:#f85149;--c2:#4493f8;--c3:#3fb950;--c4:#a371f7;--c5:#d29922;}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+.wrap{max-width:760px;margin:0 auto;padding:12px}
+h3{margin:4px 0 8px;font-size:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
+button{background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:13px;cursor:pointer}
+button.on{background:var(--c2);color:#fff;border-color:var(--c2)}
+canvas{width:100%;display:block;background:var(--bg);border:1px solid var(--border);border-radius:6px}
+.ctls{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 14px}
+@media (max-width:520px){.ctls{grid-template-columns:1fr}}
+.ctl{display:flex;align-items:center;gap:6px;font-size:13px}
+.ctl span.n{min-width:90px}
+.ctl input[type=range]{flex:1;min-width:0}
+.ctl b{min-width:52px;text-align:right;font-variant-numeric:tabular-nums}
+.legend{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:12.5px;margin:6px 0}
+.legend label{display:inline-flex;align-items:center;gap:4px;cursor:pointer}
+.sw{display:inline-block;width:14px;height:4px;border-radius:2px}
+table{border-collapse:collapse;width:100%;font-size:12.5px;font-variant-numeric:tabular-nums}
+th,td{border-bottom:1px solid var(--border);padding:3px 4px;text-align:right}
+th:first-child,td:first-child{text-align:left}
+.small{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h3>序列越长，谁先“爆炸”？全注意力 vs 滑动窗口 vs 线性注意力 vs 混合</h3>
+<div class="tabs">
+  <button id="mF" class="on">预填充计算量（FLOPs / 层）</button>
+  <button id="mM">解码时缓存/状态内存（/ 层）</button>
+  <button id="sc">纵轴：对数</button>
+</div>
+<canvas id="cv" width="720" height="330"></canvas>
+<div class="legend" id="lg"></div>
+<div class="card">
+  <div class="ctls">
+    <div class="ctl"><span class="n">d_model</span><input type="range" id="d" min="9" max="14" step="1" value="12"><b id="dv"></b></div>
+    <div class="ctl"><span class="n">head_dim</span><input type="range" id="hd" min="5" max="8" step="1" value="7"><b id="hdv"></b></div>
+    <div class="ctl"><span class="n">滑动窗口 w</span><input type="range" id="w" min="9" max="15" step="1" value="12"><b id="wv"></b></div>
+    <div class="ctl"><span class="n">混合比 线性:全</span><input type="range" id="r" min="1" max="7" step="1" value="3"><b id="rv"></b></div>
+    <div class="ctl"><span class="n">查看长度 n</span><input type="range" id="n" min="10" max="21" step="1" value="17"><b id="nv"></b></div>
+    <div class="ctl"><label><input type="checkbox" id="ffn"> 计算量里加上投影 + FFN</label></div>
+  </div>
+  <div class="small" style="margin-top:4px">KV 头数取与查询头数相同（不用 GQA）；内存按 bf16（2 字节）计；FLOPs 按“乘加 = 2 FLOPs”、不考虑因果掩码省下的一半。</div>
+</div>
+<div class="card">
+  <table id="tbl"></table>
+  <div class="small" id="msg" style="margin-top:6px"></div>
+</div>
+</div>
+<script>
+(function(){
+  var $=function(id){return document.getElementById(id);};
+  function css(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+  var metric="F", logY=true;
+  var S=[
+    {k:"full",name:"全注意力",c:"--c1",on:true},
+    {k:"swa",name:"滑动窗口",c:"--c2",on:true},
+    {k:"lin",name:"线性注意力 / SSM",c:"--c3",on:true},
+    {k:"hyb",name:"混合（线性:全）",c:"--c4",on:true},
+    {k:"ffn",name:"参考：投影+FFN",c:"--c5",on:true}
+  ];
+  function p(){ return {d:Math.pow(2,+$("d").value),hd:Math.pow(2,+$("hd").value),w:Math.pow(2,+$("w").value),r:+$("r").value,n:Math.pow(2,+$("n").value),ffn:$("ffn").checked}; }
+  function val(k,n,P){
+    var d=P.d, hd=P.hd, w=P.w, base=P.ffn? 24*n*d*d : 0;
+    if(metric==="F"){
+      var full=4*n*n*d, swa=4*n*Math.min(n,w)*d, lin=4*n*d*hd;
+      if(k==="full") return full+base;
+      if(k==="swa") return swa+base;
+      if(k==="lin") return lin+base;
+      if(k==="hyb") return (P.r*lin+full)/(P.r+1)+base;
+      if(k==="ffn") return 24*n*d*d;
+    } else {
+      var fullM=2*n*d*2, swaM=2*Math.min(n,w)*d*2, linM=d*hd*2;
+      if(k==="full") return fullM;
+      if(k==="swa") return swaM;
+      if(k==="lin") return linM;
+      if(k==="hyb") return (P.r*linM+fullM)/(P.r+1);
+      if(k==="ffn") return null;
+    }
+  }
+  function fmtF(x){ var u=[["P",1e15],["T",1e12],["G",1e9],["M",1e6],["K",1e3]]; for(var i=0;i<u.length;i++) if(x>=u[i][1]) return (x/u[i][1]).toFixed(x/u[i][1]<10?2:0)+" "+u[i][0]; return x.toFixed(0); }
+  function fmtB(x){ var u=[["TiB",1099511627776],["GiB",1073741824],["MiB",1048576],["KiB",1024]]; for(var i=0;i<u.length;i++) if(x>=u[i][1]) return (x/u[i][1]).toFixed(x/u[i][1]<10?2:0)+" "+u[i][0]; return x.toFixed(0)+" B"; }
+  function fmtN(n){ if(n>=1048576) return (n/1048576)+"M"; if(n>=1024) return (n/1024)+"K"; return String(n); }
+  function legend(){
+    $("lg").innerHTML="";
+    S.forEach(function(s){
+      if(metric==="M"&&s.k==="ffn") return;
+      var l=document.createElement("label");
+      l.innerHTML="<input type='checkbox' "+(s.on?"checked":"")+"><span class='sw' style='background:"+css(s.c)+"'></span>"+s.name;
+      l.querySelector("input").onchange=function(){ s.on=this.checked; draw(); };
+      $("lg").appendChild(l);
+    });
+  }
+  function draw(){
+    var P=p();
+    $("dv").textContent=P.d; $("hdv").textContent=P.hd; $("wv").textContent=fmtN(P.w); $("rv").textContent=P.r+":1"; $("nv").textContent=fmtN(P.n);
+    var c=$("cv"), dpr=window.devicePixelRatio||1, W=c.clientWidth, H=Math.max(220,Math.min(330,W*0.5));
+    c.width=W*dpr; c.height=H*dpr; c.style.height=H+"px";
+    var ctx=c.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H);
+    var L=58,R=10,T=10,B=28, x0=10, x1=21;
+    var ns=[]; for(var e=x0;e<=x1;e+=0.25) ns.push(Math.pow(2,e));
+    var all=[];
+    S.forEach(function(s){ if(!s.on) return; ns.forEach(function(n){ var v=val(s.k,n,P); if(v!==null&&v>0) all.push(v); }); });
+    if(!all.length) all=[1,10];
+    var ymax=Math.max.apply(null,all), ymin=Math.min.apply(null,all);
+    var ly0=Math.floor(Math.log10(ymin)), ly1=Math.ceil(Math.log10(ymax));
+    if(ly1===ly0) ly1++;
+    function X(n){ return L+(Math.log2(n)-x0)/(x1-x0)*(W-L-R); }
+    function Y(v){ if(logY) return T+(1-(Math.log10(v)-ly0)/(ly1-ly0))*(H-T-B); return T+(1-v/ymax)*(H-T-B); }
+    ctx.font="11px sans-serif"; ctx.fillStyle=css("--muted"); ctx.strokeStyle=css("--grid"); ctx.lineWidth=1;
+    if(logY){
+      var stepE=Math.max(1,Math.ceil((ly1-ly0)/6));
+      for(var k=ly0;k<=ly1;k+=stepE){ var y=Y(Math.pow(10,k)); ctx.beginPath(); ctx.moveTo(L,y); ctx.lineTo(W-R,y); ctx.stroke(); ctx.fillText(metric==="F"?fmtF(Math.pow(10,k)):fmtB(Math.pow(10,k)),2,y+4); }
+    } else {
+      for(k=0;k<=4;k++){ var v=ymax*k/4; y=Y(v); ctx.beginPath(); ctx.moveTo(L,y); ctx.lineTo(W-R,y); ctx.stroke(); ctx.fillText(metric==="F"?fmtF(v):fmtB(v),2,y+4); }
+    }
+    for(e=x0;e<=x1;e+=(W<480?2:1)){ var xx=X(Math.pow(2,e)); ctx.beginPath(); ctx.moveTo(xx,T); ctx.lineTo(xx,H-B); ctx.stroke(); ctx.fillText(fmtN(Math.pow(2,e)),xx-10,H-B+14); }
+    ctx.fillText("序列长度 n（对数轴）",W-130,H-2);
+    S.forEach(function(s){
+      if(!s.on) return; if(metric==="M"&&s.k==="ffn") return;
+      ctx.strokeStyle=css(s.c); ctx.lineWidth=s.k==="ffn"?1.5:2.4; if(s.k==="ffn") ctx.setLineDash([5,4]);
+      ctx.beginPath(); var first=true;
+      ns.forEach(function(n){ var v=val(s.k,n,P); if(v===null||v<=0) return; var px=X(n),py=Y(v); if(first){ctx.moveTo(px,py);first=false;} else ctx.lineTo(px,py); });
+      ctx.stroke(); ctx.setLineDash([]);
+    });
+    var xn=X(P.n); ctx.strokeStyle=css("--fg"); ctx.globalAlpha=0.5; ctx.setLineDash([3,3]); ctx.beginPath(); ctx.moveTo(xn,T); ctx.lineTo(xn,H-B); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha=1;
+    table(P);
+  }
+  function table(P){
+    var h="<tr><th>n = "+fmtN(P.n)+"</th><th>预填充 FLOPs/层</th><th>解码内存/层</th><th>相对全注意力</th></tr>";
+    var saveM=metric;
+    var rows=["full","swa","lin","hyb"].map(function(k){
+      metric="F"; var f=val(k,P.n,P); metric="M"; var m=val(k,P.n,P); return [k,f,m];
+    });
+    metric="F"; var ff=val("full",P.n,P); metric="M"; var fm=val("full",P.n,P); metric=saveM;
+    var names={full:"全注意力",swa:"滑动窗口 (w="+fmtN(P.w)+")",lin:"线性注意力/SSM",hyb:"混合 "+P.r+":1"};
+    rows.forEach(function(r){ h+="<tr><td>"+names[r[0]]+"</td><td>"+fmtF(r[1])+"</td><td>"+fmtB(r[2])+"</td><td>"+(r[1]/ff*100).toFixed(1)+"% / "+(r[2]/fm*100).toFixed(1)+"%</td></tr>"; });
+    $("tbl").innerHTML=h;
+    var cross=6*P.d;
+    $("msg").innerHTML="手算交叉点：注意力打分部分 4n²d 超过投影+FFN 的 24nd² 时，n &gt; 6·d_model = <b>"+fmtN(cross)+"</b>。混合模型只有 1/"+(P.r+1)+" 的层付平方代价，所以长序列下它比全注意力便宜约 "+(P.r+1)+" 倍，但仍是平方增长；线性注意力的状态大小 d_model×head_dim 与 n 无关。";
+  }
+  $("mF").onclick=function(){ metric="F"; this.className="on"; $("mM").className=""; legend(); draw(); };
+  $("mM").onclick=function(){ metric="M"; this.className="on"; $("mF").className=""; legend(); draw(); };
+  $("sc").onclick=function(){ logY=!logY; this.textContent="纵轴："+(logY?"对数":"线性"); draw(); };
+  ["d","hd","w","r","n","ffn"].forEach(function(id){ $(id).oninput=draw; $(id).onchange=draw; });
+  window.addEventListener("resize",draw);
+  legend(); draw();
+})();
+</script>
+</body>
+</html>

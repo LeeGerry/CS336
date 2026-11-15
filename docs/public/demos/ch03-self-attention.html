@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>自注意力逐步计算</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#656d76;--card:#f6f8fa;--border:#d0d7de;--accent:#0969da;--accent2:#bf3989;--good:#1a7f37;--bad:#cf222e;--cell:#0969da;}
+@media (prefers-color-scheme: dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8d96a0;--card:#161b22;--border:#30363d;--accent:#4493f8;--accent2:#db61a2;--good:#3fb950;--bad:#f85149;--cell:#4493f8;}}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+.wrap{max-width:760px;margin:0 auto;padding:12px}
+h3{margin:4px 0 8px;font-size:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+button{background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:13px;cursor:pointer}
+button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+button:disabled{opacity:.45;cursor:default}
+label{font-size:13px;display:inline-flex;align-items:center;gap:4px;cursor:pointer}
+.tok{padding:4px 10px;border-radius:14px;border:1px solid var(--border);background:var(--bg);cursor:pointer;font-size:14px}
+.tok.sel{background:var(--accent2);color:#fff;border-color:var(--accent2)}
+.tok.fut{opacity:.4}
+.steps{display:flex;gap:4px;flex-wrap:wrap;margin:6px 0}
+.st{font-size:12px;padding:2px 8px;border-radius:10px;border:1px solid var(--border);color:var(--muted)}
+.st.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+.st.done{color:var(--fg)}
+.expl{min-height:44px;font-size:13px;color:var(--fg)}
+table{border-collapse:collapse;width:100%;font-size:12.5px;font-variant-numeric:tabular-nums}
+th,td{border-bottom:1px solid var(--border);padding:3px 4px;text-align:right;white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+td.masked{color:var(--muted);text-decoration:line-through}
+td.hl{color:var(--accent2);font-weight:600}
+.scroll{overflow-x:auto}
+.bar{height:12px;background:var(--accent);border-radius:2px;display:inline-block;vertical-align:middle}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.grid2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}
+@media (max-width:560px){.grid2{grid-template-columns:minmax(0,1fr)}}
+.card{min-width:0}
+@media (max-width:420px){table{font-size:11px}.mono{font-size:10.5px}th,td{padding:2px 2px}}
+.hm{display:grid;gap:2px;font-size:11px}
+.hm div{text-align:center;padding:3px 0;border-radius:3px}
+.hm .lab{color:var(--muted);background:none}
+.hm .rowsel{outline:2px solid var(--accent2)}
+.out{display:flex;gap:6px;flex-wrap:wrap}
+.vec{font-family:ui-monospace,Menlo,monospace;font-size:12px;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:2px 6px}
+.small{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h3>自注意力逐步计算：打分 → 缩放 → 掩码 → softmax → 加权求和</h3>
+<div class="card">
+  <div class="small">点一个词作为“提问者”（query）：</div>
+  <div class="row" id="toks" style="margin:6px 0"></div>
+  <div class="row">
+    <label><input type="checkbox" id="causal" checked> 因果掩码（看不到未来）</label>
+    <label><input type="checkbox" id="scale" checked> 除以 √d<sub>k</sub></label>
+    <button id="preset">手工设计的向量</button>
+    <button id="rand">随机向量</button>
+  </div>
+</div>
+
+<div class="card">
+  <div class="steps" id="steps"></div>
+  <div class="row" style="margin-bottom:6px">
+    <button id="prev">上一步</button>
+    <button id="next" class="primary">下一步</button>
+    <button id="play">自动播放</button>
+    <button id="reset">回到开头</button>
+  </div>
+  <div class="expl" id="expl"></div>
+  <div class="scroll"><table id="tbl"></table></div>
+  <div id="outbox" style="margin-top:8px"></div>
+</div>
+
+<div class="grid2">
+  <div class="card">
+    <div style="font-weight:600;margin-bottom:4px">Q / K / V 向量（d<sub>k</sub> = 3）</div>
+    <div class="scroll"><table id="qkv"></table></div>
+    <div class="small" style="margin-top:4px">真实模型里它们由 x·W<sub>Q</sub>、x·W<sub>K</sub>、x·W<sub>V</sub> 算出，维度通常是 64~256。</div>
+  </div>
+  <div class="card">
+    <div style="font-weight:600;margin-bottom:4px">完整注意力权重矩阵（行 = query，列 = key）</div>
+    <div class="hm" id="hm"></div>
+    <div class="small" style="margin-top:4px">每一行和为 1。打开因果掩码后，右上三角全为 0。</div>
+  </div>
+</div>
+</div>
+
+<script>
+(function(){
+  var TOK = ["小猫","在","追","它的","尾巴"];
+  var PRESET = {
+    Q: [[0.5,0.2,0.2],[0.2,1.0,0.0],[1.5,0.3,0.8],[1.8,0.0,0.2],[0.8,0.2,1.2]],
+    K: [[2.0,0.0,0.2],[0.0,0.3,0.1],[0.3,1.5,0.0],[1.0,0.0,1.2],[0.2,0.5,2.0]],
+    V: [[1.0,0.0,0.0],[0.0,0.2,0.1],[0.0,1.0,0.0],[0.5,0.0,0.5],[0.0,0.0,1.0]]
+  };
+  var Q, K, V;
+  var n = TOK.length, d = 3;
+  var sel = 3, step = 0, timer = null;
+  var STEPS = ["① 准备 Q/K/V","② 点积打分","③ 缩放","④ 因果掩码","⑤ softmax","⑥ 加权求和"];
+
+  function copy(m){ return m.map(function(r){ return r.slice(); }); }
+  function setPreset(){ Q = copy(PRESET.Q); K = copy(PRESET.K); V = copy(PRESET.V); }
+  function rnd(){ return Math.round((Math.random()*4-2)*10)/10; }
+  function setRandom(){
+    Q=[];K=[];V=[];
+    for(var i=0;i<n;i++){
+      Q.push([rnd(),rnd(),rnd()]); K.push([rnd(),rnd(),rnd()]);
+      V.push([Math.abs(rnd())/2,Math.abs(rnd())/2,Math.abs(rnd())/2].map(function(x){return Math.round(x*10)/10;}));
+    }
+  }
+  function dot(a,b){ var s=0; for(var i=0;i<a.length;i++) s+=a[i]*b[i]; return s; }
+  function f(x,k){ if(x===-Infinity) return "−∞"; return (k===undefined?x.toFixed(2):x.toFixed(k)); }
+  function causal(){ return document.getElementById("causal").checked; }
+  function scaled(){ return document.getElementById("scale").checked; }
+
+  function rowCalc(i){
+    var raw=[], sc=[], msk=[], ex=[], w=[];
+    var c = scaled()? Math.sqrt(d) : 1;
+    for(var j=0;j<n;j++){
+      raw.push(dot(Q[i],K[j]));
+      sc.push(raw[j]/c);
+      msk.push(causal() && j>i ? -Infinity : sc[j]);
+    }
+    var mx = Math.max.apply(null, msk.filter(function(x){return x!==-Infinity;}));
+    var sum=0;
+    for(j=0;j<n;j++){ var e = msk[j]===-Infinity?0:Math.exp(msk[j]-mx); ex.push(e); sum+=e; }
+    for(j=0;j<n;j++) w.push(ex[j]/sum);
+    var out=[0,0,0];
+    for(j=0;j<n;j++) for(var t=0;t<d;t++) out[t]+=w[j]*V[j][t];
+    return {raw:raw,sc:sc,msk:msk,ex:ex,sum:sum,w:w,out:out,mx:mx,c:c};
+  }
+
+  function renderToks(){
+    var box=document.getElementById("toks"); box.innerHTML="";
+    TOK.forEach(function(t,i){
+      var b=document.createElement("span");
+      b.className="tok"+(i===sel?" sel":"")+(causal()&&i>sel&&step>=3?" fut":"");
+      b.textContent=i+":"+t;
+      b.onclick=function(){ sel=i; render(); };
+      box.appendChild(b);
+    });
+  }
+  function renderSteps(){
+    var box=document.getElementById("steps"); box.innerHTML="";
+    STEPS.forEach(function(s,i){
+      var e=document.createElement("span");
+      e.className="st"+(i===step?" on":(i<step?" done":""));
+      e.textContent=s; box.appendChild(e);
+    });
+    document.getElementById("prev").disabled = step===0;
+    document.getElementById("next").disabled = step===STEPS.length-1;
+  }
+  function vecStr(v){ return "["+v.map(function(x){return x.toFixed(1);}).join(", ")+"]"; }
+
+  function renderTable(){
+    var r=rowCalc(sel), q=Q[sel], tb=document.getElementById("tbl"), ex=document.getElementById("expl");
+    var h="<tr><th>key 词</th>";
+    if(step>=1) h+="<th>q·k</th>";
+    if(step>=2) h+="<th>"+(scaled()?"÷√3":"(不缩放)")+"</th>";
+    if(step>=3) h+="<th>掩码后</th>";
+    if(step>=4) h+="<th>e^(x−max)</th><th>权重</th><th style='text-align:left;width:30%'></th>";
+    h+="</tr>";
+    for(var j=0;j<n;j++){
+      var m = r.msk[j]===-Infinity;
+      h+="<tr><td>"+j+":"+TOK[j]+"</td>";
+      if(step===1){
+        var parts=[]; for(var t=0;t<d;t++) parts.push(q[t].toFixed(1)+"×"+K[j][t].toFixed(1));
+        h+="<td class='mono' style='white-space:normal'>"+parts.join(" + ")+" = <b>"+f(r.raw[j])+"</b></td>";
+      } else if(step>=1) h+="<td>"+f(r.raw[j])+"</td>";
+      if(step>=2) h+="<td>"+f(r.sc[j])+"</td>";
+      if(step>=3) h+="<td class='"+(m?"masked":"")+"'>"+f(r.msk[j])+"</td>";
+      if(step>=4){
+        h+="<td class='"+(m?"masked":"")+"'>"+f(r.ex[j],3)+"</td><td class='hl'>"+f(r.w[j],3)+"</td>";
+        h+="<td style='text-align:left'><span class='bar' style='width:"+(r.w[j]*100).toFixed(1)+"%'></span></td>";
+      }
+      h+="</tr>";
+    }
+    if(step<1){ h=""; }
+    tb.innerHTML=h;
+
+    var txt="";
+    var who = "“"+TOK[sel]+"”";
+    if(step===0) txt="每个词都有三个向量：Q（我想找什么）、K（我能提供什么的标签）、V（我真正携带的内容）。现在由 "+who+" 提问，它的 q = <span class='mono'>"+vecStr(q)+"</span>。点“下一步”开始。";
+    if(step===1) txt="用 "+who+" 的 q 和每个词的 k 做点积：对应位置相乘再相加。分数越大，表示“越对胃口”。";
+    if(step===2) txt=scaled()?"把分数除以 √d<sub>k</sub> = √3 ≈ 1.73。维度越高点积越容易变得很大，缩放能防止 softmax 变得过于“尖锐”。":"你关掉了缩放：分数保持原样。试着打开/关闭，看看最后的权重分布会变尖还是变平。";
+    if(step===3) txt=causal()?"因果掩码：语言模型预测下一个词时不能偷看后文，所以位置 j > "+sel+" 的分数被设成 −∞（softmax 后变成 0）。":"你关掉了因果掩码：每个词都能看到所有词（像 BERT 那样的双向注意力）。";
+    if(step===4) txt="softmax：先减去最大值（"+f(r.mx)+"，数值稳定技巧），取指数，再除以总和 "+f(r.sum,3)+"，得到一组和为 1 的权重。";
+    if(step===5) txt="按权重把各个词的 V 加起来，就得到 "+who+" 这一位置的输出。它把“它关注的那些词”的信息混进了自己。";
+    ex.innerHTML=txt;
+
+    var ob=document.getElementById("outbox");
+    if(step===5){
+      var s="<div class='mono' style='white-space:normal'>输出 = ";
+      var terms=[];
+      for(j=0;j<n;j++){ if(r.w[j]>0.0005) terms.push(f(r.w[j],2)+"×"+vecStr(V[j])); }
+      s+=terms.join(" + ")+"</div><div style='margin-top:4px'>= <span class='vec' style='border-color:var(--accent2)'>["+r.out.map(function(x){return x.toFixed(3);}).join(", ")+"]</span></div>";
+      ob.innerHTML=s;
+    } else ob.innerHTML="";
+  }
+
+  function renderQKV(){
+    var h="<tr><th>词</th><th>Q</th><th>K</th><th>V</th></tr>";
+    for(var i=0;i<n;i++){
+      h+="<tr"+(i===sel?" style='color:var(--accent2);font-weight:600'":"")+"><td>"+TOK[i]+"</td><td class='mono'>"+vecStr(Q[i])+"</td><td class='mono'>"+vecStr(K[i])+"</td><td class='mono'>"+vecStr(V[i])+"</td></tr>";
+    }
+    document.getElementById("qkv").innerHTML=h;
+  }
+  function renderHM(){
+    var hm=document.getElementById("hm"); hm.style.gridTemplateColumns="44px repeat("+n+",1fr)";
+    var h="<div class='lab'></div>";
+    for(var j=0;j<n;j++) h+="<div class='lab'>"+TOK[j]+"</div>";
+    var dark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    for(var i=0;i<n;i++){
+      var r=rowCalc(i);
+      h+="<div class='lab' style='text-align:left'>"+TOK[i]+"</div>";
+      for(j=0;j<n;j++){
+        var w=r.w[j], a=Math.min(1,w*1.4);
+        var bg = dark? "rgba(68,147,248,"+a+")" : "rgba(9,105,218,"+a+")";
+        var col = a>0.5? "#fff" : "inherit";
+        h+="<div class='"+(i===sel?"rowsel":"")+"' style='background:"+bg+";color:"+col+"'>"+(r.msk[j]===-Infinity?"·":w.toFixed(2))+"</div>";
+      }
+    }
+    hm.innerHTML=h;
+  }
+  function render(){ renderToks(); renderSteps(); renderTable(); renderQKV(); renderHM(); }
+
+  document.getElementById("next").onclick=function(){ if(step<STEPS.length-1){step++;render();} };
+  document.getElementById("prev").onclick=function(){ if(step>0){step--;render();} };
+  document.getElementById("reset").onclick=function(){ step=0; render(); };
+  document.getElementById("play").onclick=function(){
+    var btn=this;
+    if(timer){ clearInterval(timer); timer=null; btn.textContent="自动播放"; return; }
+    step=0; render(); btn.textContent="暂停";
+    timer=setInterval(function(){
+      if(step<STEPS.length-1){ step++; render(); }
+      else { clearInterval(timer); timer=null; btn.textContent="自动播放"; }
+    },1400);
+  };
+  document.getElementById("causal").onchange=render;
+  document.getElementById("scale").onchange=render;
+  document.getElementById("preset").onclick=function(){ setPreset(); render(); };
+  document.getElementById("rand").onclick=function(){ setRandom(); render(); };
+  setPreset(); render();
+})();
+</script>
+</body>
+</html>

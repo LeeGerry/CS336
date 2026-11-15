@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>μP：学习率随宽度迁移</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#656d76;--card:#f6f8fa;--border:#d0d7de;--accent:#2563eb;--accent2:#ea580c;--good:#16a34a;--bad:#dc2626;--grid:#e5e7eb}
+@media (prefers-color-scheme: dark){:root{--bg:#1b1b1f;--fg:#e6edf3;--muted:#9aa4af;--card:#24262b;--border:#3a3f47;--accent:#60a5fa;--accent2:#fb923c;--good:#4ade80;--bad:#f87171;--grid:#30363d}}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+h3{margin:0 0 4px;font-size:16px}
+h4{margin:10px 0 4px;font-size:14px}
+.muted{color:var(--muted);font-size:12.5px}
+.controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px 16px;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin:8px 0}
+.controls label{display:block;font-size:13px}.controls label input[type=range],.controls label select{display:block;width:100%;margin-top:2px}
+input[type=range]{width:100%}
+.seg{display:flex;gap:0;border:1px solid var(--border);border-radius:6px;overflow:hidden;width:max-content;max-width:100%}
+.seg button{background:transparent;color:var(--fg);border:0;padding:6px 12px;cursor:pointer;font-size:13px}
+.seg button.on{background:var(--accent);color:#fff}
+svg{width:100%;height:auto;display:block}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media (max-width:620px){.grid2{grid-template-columns:1fr}}
+table{border-collapse:collapse;width:100%;font-size:12.5px;margin-top:6px}
+td,th{border:1px solid var(--border);padding:3px 6px;text-align:center}
+th{background:var(--card)}
+.bad{color:var(--bad)}.good{color:var(--good)}
+</style>
+</head>
+<body>
+<h3>为什么宽度一变，最优学习率就跑了？μP 怎么把它"钉住"？</h3>
+<div class="muted">实验：一个 n×n 的隐藏层，输入激活每个分量约为 1。用 Adam（第一步 ≈ 按梯度符号走 η）更新一步，<b>真实计算</b>输出激活改变了多少。基准宽度 n<sub>base</sub> = 256。</div>
+<div class="controls">
+  <label>参数化方式
+    <div class="seg" id="seg"><button data-v="sp" class="on">标准参数化 SP</button><button data-v="mup">μP</button></div>
+  </label>
+  <label>基准学习率 η₀ = 2^<span id="lrV"></span>（≈ <span id="lrV2"></span>）<input id="lr" type="range" min="-14" max="-4" step="0.25" value="-8"></label>
+</div>
+<div class="grid2">
+  <div>
+    <h4>① 一步更新后，激活每个分量平均变化多少（RMS of Δh）</h4>
+    <svg id="pa" viewBox="0 0 340 260"></svg>
+  </div>
+  <div>
+    <h4>② 由此导致的"损失 vs 学习率"曲线（示意）</h4>
+    <svg id="pb" viewBox="0 0 340 260"></svg>
+  </div>
+</div>
+<div style="overflow-x:auto"><table id="tbl"></table></div>
+<p class="muted" id="note"></p>
+<p class="muted">说明：图①是对随机矩阵的真实计算；图②是简化模型——假设"每步激活变化量"偏离理想值越多损失越高、偏离太多就发散，用来直观展示最优学习率为何会漂移。真实网络的曲线形状不同，但"SP 下最优 LR 随宽度左移、μP 下对齐"这一现象与 MiniCPM、Cerebras-GPT 等报告一致。</p>
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const widths=[64,128,256,512,1024,2048];
+  const NB=256;
+  let mode='sp';
+  function randn(){let u=0,v=0;while(!u)u=Math.random();while(!v)v=Math.random();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);}
+  // ---- real computation (independent of eta, linear in eta) ----
+  const base={};
+  for(const n of widths){
+    const h=new Float64Array(n),delta=new Float64Array(n);
+    for(let j=0;j<n;j++){h[j]=randn();delta[j]=randn();}
+    // init W ~ N(0, 1/n) ; h_out = W h
+    const sd=1/Math.sqrt(n);let ss=0;
+    for(let i=0;i<n;i++){let acc=0;for(let j=0;j<n;j++)acc+=randn()*sd*h[j];ss+=acc*acc;}
+    const initRms=Math.sqrt(ss/n);
+    // gradient wrt W: g_ij = delta_i * h_j ; Adam first step: dW_ij = -eta*sign(g_ij)
+    // dh_i = sum_j dW_ij h_j  (computed explicitly, eta=1)
+    let ss2=0;
+    for(let i=0;i<n;i++){let acc=0;const si=Math.sign(delta[i]);for(let j=0;j<n;j++){acc+=-si*Math.sign(h[j])*h[j];}ss2+=acc*acc;}
+    base[n]={initRms,dRmsPerEta:Math.sqrt(ss2/n)};
+  }
+  function etaFor(n,eta0){return mode==='sp'?eta0:eta0*NB/n;}
+  function dRms(n,eta0){return base[n].dRmsPerEta*etaFor(n,eta0);}
+  const target=base[NB].dRmsPerEta*Math.pow(2,-8); // "ideal" change size at base width & base-optimal LR
+  // stylized loss: depends on log ratio of actual change to ideal change
+  function lossAt(n,eta0){
+    const r=Math.log10(dRms(n,eta0)/target);
+    const floor=2.4+1.4*Math.pow(n/64,-0.35);
+    let L=floor+0.35*r*r;
+    if(r>0.9)L+=3*(r-0.9)*(r-0.9)*4; // instability
+    return Math.min(L,6);
+  }
+  const colors=n=>`hsl(${200-35*Math.log2(n/64)},70%,${50}%)`;
+  function draw(){
+    const lr=+$('lr').value,eta0=Math.pow(2,lr);
+    $('lrV').textContent=lr;$('lrV2').textContent=eta0.toExponential(1);
+    // panel A
+    {
+      const W=340,H=260,ml=46,mr=10,mt=10,mb=38;
+      const xs=n=>ml+(Math.log2(n)-6)/(11-6)*(W-ml-mr);
+      const vals=widths.map(n=>dRms(n,eta0));const tv=target;
+      let all=[...widths.map(n=>base[n].dRmsPerEta*Math.pow(2,-14)),...widths.map(n=>base[n].dRmsPerEta*Math.pow(2,-4))];
+      const Y0=Math.floor(Math.log10(Math.min(...all,...vals)))-0.2,Y1=Math.ceil(Math.log10(Math.max(...all,...vals)))+0.1;
+      const ys=v=>mt+(1-(Math.log10(v)-Y0)/(Y1-Y0))*(H-mt-mb);
+      let s='';
+      for(const n of widths){s+=`<line x1="${xs(n)}" x2="${xs(n)}" y1="${mt}" y2="${H-mb}" stroke="var(--grid)"/><text x="${xs(n)}" y="${H-mb+14}" font-size="10" text-anchor="middle" fill="var(--muted)">${n}</text>`;}
+      for(let e=Math.ceil(Y0);e<=Math.floor(Y1);e++){s+=`<line x1="${ml}" x2="${W-mr}" y1="${ys(10**e)}" y2="${ys(10**e)}" stroke="var(--grid)"/><text x="${ml-4}" y="${ys(10**e)+3}" font-size="10" text-anchor="end" fill="var(--muted)">1e${e}</text>`;}
+      s+=`<text x="${(ml+W)/2}" y="${H-6}" font-size="11" text-anchor="middle" fill="var(--muted)">宽度 n</text>`;
+      // ideal band
+      s+=`<rect x="${ml}" y="${ys(tv*2)}" width="${W-ml-mr}" height="${ys(tv/2)-ys(tv*2)}" fill="var(--good)" opacity="0.12"/>`;
+      s+=`<text x="${W-mr-4}" y="${ys(tv*2)-3}" font-size="10" text-anchor="end" fill="var(--good)">理想区间（变化量 Θ(1)）</text>`;
+      let d='';widths.forEach((n,i)=>{d+=(i?'L':'M')+xs(n)+','+ys(vals[i]);});
+      s+=`<path d="${d}" stroke="${mode==='sp'?'var(--bad)':'var(--accent)'}" stroke-width="2.2" fill="none"/>`;
+      widths.forEach((n,i)=>{s+=`<circle cx="${xs(n)}" cy="${ys(vals[i])}" r="4" fill="${colors(n)}"/>`;});
+      $('pa').innerHTML=s;
+    }
+    // panel B
+    {
+      const W=340,H=260,ml=40,mr=10,mt=10,mb=38;
+      const X0=-14,X1=-4,Y0=2.4,Y1=4.6;
+      const xs=x=>ml+(x-X0)/(X1-X0)*(W-ml-mr), ys=y=>mt+(1-(Math.min(y,Y1)-Y0)/(Y1-Y0))*(H-mt-mb);
+      let s='';
+      for(let x=-14;x<=-4;x+=2){s+=`<line x1="${xs(x)}" x2="${xs(x)}" y1="${mt}" y2="${H-mb}" stroke="var(--grid)"/><text x="${xs(x)}" y="${H-mb+14}" font-size="10" text-anchor="middle" fill="var(--muted)">2^${x}</text>`;}
+      for(let y=2.5;y<=4.5;y+=0.5){s+=`<line x1="${ml}" x2="${W-mr}" y1="${ys(y)}" y2="${ys(y)}" stroke="var(--grid)"/><text x="${ml-4}" y="${ys(y)+3}" font-size="10" text-anchor="end" fill="var(--muted)">${y}</text>`;}
+      s+=`<text x="${(ml+W)/2}" y="${H-6}" font-size="11" text-anchor="middle" fill="var(--muted)">基准学习率 η₀（对数）</text>`;
+      for(const n of widths){
+        let d='',best=null;
+        for(let x=X0;x<=X1+1e-9;x+=0.05){const L=lossAt(n,Math.pow(2,x));d+=(d?'L':'M')+xs(x).toFixed(1)+','+ys(L).toFixed(1);if(!best||L<best[1])best=[x,L];}
+        s+=`<path d="${d}" stroke="${colors(n)}" stroke-width="1.8" fill="none"/>`;
+        s+=`<circle cx="${xs(best[0])}" cy="${ys(best[1])}" r="3.5" fill="${colors(n)}" stroke="var(--fg)" stroke-width="0.8"/>`;
+        base[n].best=best[0];
+      }
+      s+=`<line x1="${xs(lr)}" x2="${xs(lr)}" y1="${mt}" y2="${H-mb}" stroke="var(--fg)" stroke-dasharray="4 3"/>`;
+      // legend
+      widths.forEach((n,i)=>{s+=`<g font-size="10"><rect x="${ml+6+(i%3)*56}" y="${mt+4+Math.floor(i/3)*13}" width="10" height="3" fill="${colors(n)}"/><text x="${ml+20+(i%3)*56}" y="${mt+9+Math.floor(i/3)*13}" fill="var(--fg)">n=${n}</text></g>`;});
+      $('pb').innerHTML=s;
+    }
+    // table
+    let t='<tr><th>宽度 n</th><th>初始化后激活 RMS</th><th>该层实际学习率</th><th>一步后 RMS(Δh)</th><th>图②中最优 η₀</th></tr>';
+    for(const n of widths){
+      const v=dRms(n,eta0),ok=v<target*2&&v>target/2;
+      t+=`<tr><td>${n}</td><td>${base[n].initRms.toFixed(2)}</td><td>${etaFor(n,eta0).toExponential(1)}</td><td class="${ok?'good':'bad'}">${v.toFixed(3)}</td><td>2^${base[n].best.toFixed(1)}</td></tr>`;
+    }
+    $('tbl').innerHTML=t;
+    $('note').innerHTML=mode==='sp'
+      ? '标准参数化：每层学习率都等于 η₀。Adam 每个权重都走约 η 的一步，而输出是 n 个输入的累加，所以 Δh ≈ η·n·E|h| —— <b>宽度翻倍，激活变化也翻倍</b>。要保持变化量不变，最优学习率只能 ∝ 1/n，于是图②的最优点随宽度向左移。'
+      : 'μP（Adam 版）：隐藏层学习率按 1/fan_in 缩放，即 η = η₀·n<sub>base</sub>/n。宽度翻倍时，单个权重步长减半，正好抵消"累加项翻倍"，Δh 保持 Θ(1)，<b>各宽度的最优 η₀ 对齐</b>——在小模型上调好的 η₀ 可以直接搬到大模型。';
+  }
+  document.querySelectorAll('#seg button').forEach(b=>b.onclick=()=>{mode=b.dataset.v;document.querySelectorAll('#seg button').forEach(x=>x.classList.toggle('on',x===b));draw();});
+  $('lr').addEventListener('input',draw);
+  draw();
+})();
+</script>
+</body>
+</html>

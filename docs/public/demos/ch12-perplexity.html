@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>困惑度计算器</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#656d76;--card:#f6f8fa;--border:#d0d7de;--accent:#2563eb;--accent2:#ea580c;--good:#16a34a;--bad:#dc2626;--grid:#e5e7eb;--prompt:#e0e7ff;--resp:#ffedd5}
+@media (prefers-color-scheme: dark){:root{--bg:#1b1b1f;--fg:#e6edf3;--muted:#9aa4af;--card:#24262b;--border:#3a3f47;--accent:#60a5fa;--accent2:#fb923c;--good:#4ade80;--bad:#f87171;--grid:#30363d;--prompt:#1e2a4a;--resp:#40281a}}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+h3{margin:0 0 4px;font-size:16px}
+.muted{color:var(--muted);font-size:12.5px}
+.row{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:8px 0}
+button{background:transparent;color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:5px 10px;cursor:pointer;font-size:13px}
+button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+.tok{display:grid;grid-template-columns:88px 1fr 70px 64px;gap:8px;align-items:center;padding:4px 6px;border-radius:6px;margin:3px 0}
+.tok.p{background:var(--prompt)}.tok.r{background:var(--resp)}
+.tok.off{opacity:.45}
+.tok code{font-size:13px;white-space:pre}
+.tok input{width:100%}
+.bar{height:10px;background:var(--accent2);border-radius:3px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:10px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:6px 8px}
+.stat b{display:block;font-size:18px}
+.bad{color:var(--bad)}.good{color:var(--good)}
+.hdr{display:grid;grid-template-columns:88px 1fr 70px 64px;gap:8px;font-size:12px;color:var(--muted);padding:0 6px}
+@media (max-width:420px){.tok,.hdr{grid-template-columns:70px 1fr 56px 44px;gap:4px}}
+label.ck{display:flex;gap:6px;align-items:center;font-size:13px}
+</style>
+</head>
+<body>
+<h3>困惑度计算器：模型给每个 token 的概率 → 交叉熵 → 困惑度</h3>
+<div class="muted">句子 "Stanford was founded in 1885." 被切成 7 个 token。拖动滑块设置模型给<b>正确的下一个 token</b> 分配的概率 p（对数刻度）。</div>
+<div class="row">
+  <span class="muted">预设模型：</span>
+  <button data-p="good" class="on">较好的模型</button>
+  <button data-p="bad">较差的模型</button>
+  <button data-p="unif">均匀乱猜（词表 5 万）</button>
+  <button data-p="cheat">"作弊"模型（永远报 p=1）</button>
+</div>
+<label class="ck"><input type="checkbox" id="cond"> 只算回答部分（条件困惑度 p(回答 | 提示)，提示 = "Stanford was founded in"）</label>
+<div class="hdr" style="margin-top:8px"><span>token</span><span>p(正确 token | 前文)</span><span>−log₂p (比特)</span><span>损失条</span></div>
+<div id="toks"></div>
+<div class="stats">
+  <div class="stat"><span class="muted">参与计算的 token 数</span><b id="nT">-</b></div>
+  <div class="stat"><span class="muted">平均交叉熵（nats / token）</span><b id="ce">-</b></div>
+  <div class="stat"><span class="muted">平均交叉熵（bits / token）</span><b id="bits">-</b></div>
+  <div class="stat"><span class="muted">困惑度 PPL = e^交叉熵</span><b id="ppl">-</b></div>
+</div>
+<p id="valid" class="muted"></p>
+<p class="muted">直觉：困惑度 = "模型平均在多少个候选词里犹豫"。均匀乱猜 5 万个词 → PPL = 50000；每个 token 都百分百猜中 → PPL = 1。PPL 是概率的<b>几何平均</b>的倒数，所以一个极小的概率（比如 1e-5）就能把整体拉得很差。</p>
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const V=50000;
+  const toks=['Stanford',' was',' founded',' in',' 18','85','.'];
+  const isResp=[0,0,0,0,1,1,1];
+  const presets={good:[0.002,0.35,0.25,0.9,0.5,0.9,0.6],bad:[0.0005,0.15,0.03,0.5,0.03,0.08,0.3],unif:Array(7).fill(1/V),cheat:Array(7).fill(1)};
+  let probs=presets.good.slice(),cheat=false;
+  const box=$('toks');
+  toks.forEach((t,i)=>{
+    const d=document.createElement('div');d.className='tok '+(isResp[i]?'r':'p');d.id='row'+i;
+    d.innerHTML=`<code>${JSON.stringify(t)}</code><div><input type="range" min="-5" max="0" step="0.01" id="s${i}"><span class="muted" id="pv${i}"></span></div><span id="b${i}"></span><div><div class="bar" id="bar${i}"></div></div>`;
+    box.appendChild(d);
+    d.querySelector('input').addEventListener('input',e=>{probs[i]=Math.pow(10,+e.target.value);cheat=false;setPresetBtn(null);draw(false);});
+  });
+  function setPresetBtn(k){document.querySelectorAll('button[data-p]').forEach(b=>b.classList.toggle('on',b.dataset.p===k));}
+  document.querySelectorAll('button[data-p]').forEach(b=>b.onclick=()=>{probs=presets[b.dataset.p].slice();cheat=b.dataset.p==='cheat';setPresetBtn(b.dataset.p);draw(true);});
+  $('cond').addEventListener('change',()=>draw(false));
+  function draw(syncSliders){
+    const cond=$('cond').checked;
+    let sum=0,n=0;
+    toks.forEach((t,i)=>{
+      const p=probs[i],used=!cond||isResp[i];
+      if(syncSliders)$('s'+i).value=Math.log10(p);
+      $('pv'+i).textContent=' p = '+(p<0.001?p.toExponential(1):p.toFixed(3));
+      const bits=-Math.log2(p);
+      $('b'+i).textContent=bits.toFixed(2);
+      $('bar'+i).style.width=Math.min(100,bits/16*100)+'%';
+      $('row'+i).classList.toggle('off',!used);
+      if(used){sum+=-Math.log(p);n++;}
+    });
+    const ce=sum/n;
+    $('nT').textContent=n;
+    $('ce').textContent=ce.toFixed(3);
+    $('bits').textContent=(ce/Math.LN2).toFixed(3);
+    const ppl=Math.exp(ce);
+    $('ppl').innerHTML=`<span class="${ppl<20?'good':ppl>1000?'bad':''}">${ppl<1000?ppl.toFixed(2):ppl.toExponential(2)}</span>`;
+    $('valid').innerHTML=cheat
+      ? '<span class="bad">⚠ 合法性检查失败：</span>这个"模型"对任何位置、任何候选词都报 p=1，所以每个位置上 5 万个候选词的概率加起来是 50000，而不是 1。它拿到了完美的 PPL=1，但根本不是一个概率分布。这就是讲课里说的：运营困惑度排行榜时，你必须<b>信任</b>提交者返回的 log 概率是合法的。'
+      : '合法性检查：每个位置上，剩下的 1−p 概率被分给其余 49999 个候选词，总和为 1 ✓（这一点在黑盒排行榜上其实无法直接验证）。';
+  }
+  draw(true);
+})();
+</script>
+</body>
+</html>

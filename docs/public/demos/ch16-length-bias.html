@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GRPO 的两个偏差</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#656d76;--card:#f6f8fa;--border:#d0d7de;--accent:#2563eb;--good:#16a34a;--bad:#dc2626;--warn:#d97706;--off:#e5e7eb;--purple:#7c3aed}
+@media (prefers-color-scheme: dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8b949e;--card:#161b22;--border:#30363d;--accent:#58a6ff;--good:#4ade80;--bad:#f87171;--warn:#f59e0b;--off:#21262d;--purple:#a78bfa}}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+h3{margin:0 0 6px;font-size:16px}
+.tabs{display:flex;gap:6px;margin-bottom:8px}
+.tabs button{flex:1}
+select,button{font:inherit;padding:4px 10px;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--fg);cursor:pointer}
+button.on,button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px;font-size:13px}
+input[type=range]{width:140px;vertical-align:middle}
+canvas{width:100%;display:block}
+.note{font-size:12px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:11.5px}
+td,th{border-bottom:1px solid var(--border);padding:3px 4px;text-align:right}
+td:first-child,th:first-child{text-align:left}
+.hide{display:none}
+</style>
+</head>
+<body>
+<h3>GRPO 的两个「不正宗」之处</h3>
+<div class="tabs"><button id="t1" class="on">① 按长度归一化</button><button id="t2">② 除以标准差</button></div>
+
+<div id="pane1">
+  <div class="note">简化模型：对某道题，模型只会写三种回答——正确（200 token）、简短的错误回答、冗长的错误回答。比较两种损失归一化方式下，整条回答受到的「有效更新权重」= 优势 × 归一化系数。</div>
+  <div class="row" style="margin-top:6px">
+    <label>简短错误回答长度 <input type="range" id="ls" min="20" max="200" step="10" value="50"> <b id="lsv"></b></label>
+    <label>冗长错误回答长度 <input type="range" id="ll" min="200" max="2000" step="50" value="800"> <b id="llv"></b></label>
+  </div>
+  <div class="row">
+    <button class="primary" id="run">▶ 模拟训练 300 步</button><button id="rs">重置</button>
+  </div>
+  <div class="card" style="overflow-x:auto">
+    <table id="tab"></table>
+  </div>
+  <div class="card">
+    <div class="note"><span style="color:var(--bad)">━ GRPO（除以自身长度）</span>　<span style="color:var(--accent)">━ Dr. GRPO（除以固定常数）</span>　实线：错误回答的平均长度；虚线：答对概率</div>
+    <canvas id="c1" width="640" height="200" style="height:200px"></canvas>
+  </div>
+  <div class="note" id="m1"></div>
+</div>
+
+<div id="pane2" class="hide">
+  <div class="note">二元奖励（对=1，错=0），一道题的正确率为 p。看看在一组足够大的采样里，这道题对参数更新的「总强度」Σ|A_i| / G 如何随 p 变化。</div>
+  <div class="row" style="margin-top:6px"><label>正确率 p <input type="range" id="p" min="0.01" max="0.99" step="0.01" value="0.1"> <b id="pv"></b></label></div>
+  <div class="card">
+    <div class="note"><span style="color:var(--bad)">━ GRPO：除以标准差，强度 = 2√(p(1−p))</span>　<span style="color:var(--accent)">━ 只减均值：强度 = 2p(1−p)</span>　<span style="color:var(--purple)">┅ 两者之比（右轴）</span></div>
+    <canvas id="c2" width="640" height="220" style="height:220px"></canvas>
+  </div>
+  <div class="card" id="m2"></div>
+</div>
+
+<script>
+(function(){
+function $(i){return document.getElementById(i);}
+var cs=getComputedStyle(document.body);
+function col(n){return cs.getPropertyValue(n);}
+$('t1').onclick=function(){$('t1').classList.add('on');$('t2').classList.remove('on');$('pane1').classList.remove('hide');$('pane2').classList.add('hide');};
+$('t2').onclick=function(){$('t2').classList.add('on');$('t1').classList.remove('on');$('pane2').classList.remove('hide');$('pane1').classList.add('hide');draw2();};
+
+// ---------- pane 1 ----------
+var LC=200,sim=null,timer=null;
+function L(){return [LC,+$('ls').value,+$('ll').value];}
+function softmax(t){var m=Math.max.apply(null,t),e=t.map(function(x){return Math.exp(x-m);}),s=e.reduce(function(a,b){return a+b;},0);return e.map(function(x){return x/s;});}
+function newSim(){var t=[Math.log(0.2),Math.log(0.4),Math.log(0.4)];return {g:{t:t.slice(),h:[]},d:{t:t.slice(),h:[]}};}
+function stepOne(s,mode){
+  var p=softmax(s.t),r=[1,0,0],m=p[0],sd=Math.sqrt(p[0]*(1-p[0]))+1e-4,len=L(),g=[0,0,0];
+  for(var k=0;k<3;k++){
+    var A=(r[k]-m)/sd;
+    var w=mode==='g'?A*LC/len[k]:A; // GRPO: A/|o| (按正确回答长度缩放到同一量级)；Dr: A/常数
+    for(var j=0;j<3;j++)g[j]+=p[k]*w*((j===k?1:0)-p[j]);
+  }
+  for(var j2=0;j2<3;j2++)s.t[j2]+=0.06*g[j2];
+}
+function rec(s){var p=softmax(s.t),len=L(),wl=(p[1]*len[1]+p[2]*len[2])/(p[1]+p[2]);s.h.push({wl:wl,pc:p[0]});}
+function resetSim(){if(timer){clearInterval(timer);timer=null;}sim=newSim();rec(sim.g);rec(sim.d);render1();}
+function render1(){
+  var len=L();$('lsv').textContent=len[1];$('llv').textContent=len[2];
+  var pg=softmax(sim.g.t),pd=softmax(sim.d.t);
+  var p0=softmax([Math.log(0.2),Math.log(0.4),Math.log(0.4)]),m=p0[0],sd=Math.sqrt(m*(1-m));
+  var names=['正确回答','简短错误','冗长错误'],h='<tr><th>回答</th><th>长度</th><th>优势 A（初始）</th><th>GRPO 每 token 系数 A/|o|</th><th>Dr. GRPO 每 token 系数 A/L_max</th><th>GRPO 概率</th><th>Dr. 概率</th></tr>';
+  for(var k=0;k<3;k++){var A=((k===0?1:0)-m)/sd;
+    h+='<tr><td>'+names[k]+'</td><td>'+len[k]+'</td><td style="color:'+(A>0?'var(--good)':'var(--bad)')+'">'+A.toFixed(2)+'</td><td>'+(A/len[k]).toExponential(2)+'</td><td>'+(A/2000).toExponential(2)+'</td><td>'+(pg[k]*100).toFixed(1)+'%</td><td>'+(pd[k]*100).toFixed(1)+'%</td></tr>';}
+  $('tab').innerHTML=h;
+  var cv=$('c1'),ctx=cv.getContext('2d'),W=cv.width,H=cv.height;ctx.clearRect(0,0,W,H);
+  ctx.strokeStyle=col('--border');ctx.beginPath();ctx.moveTo(36,6);ctx.lineTo(36,H-16);ctx.lineTo(W-30,H-16);ctx.stroke();
+  var maxL=len[2]*1.05,n=301;
+  ctx.fillStyle=col('--muted');ctx.font='11px sans-serif';ctx.fillText(Math.round(maxL)+'',2,14);ctx.fillText('0',24,H-16);ctx.fillText('100%',W-30,14);
+  function pl(hh,key,c,scale,dash){ctx.strokeStyle=c;ctx.lineWidth=2;ctx.setLineDash(dash?[5,4]:[]);ctx.beginPath();hh.forEach(function(v,i){var x=36+(W-70)*i/(n-1),y=(H-16)-(H-24)*v[key]/scale;if(i)ctx.lineTo(x,y);else ctx.moveTo(x,y);});ctx.stroke();ctx.setLineDash([]);ctx.lineWidth=1;}
+  pl(sim.g.h,'wl',col('--bad'),maxL,false);pl(sim.d.h,'wl',col('--accent'),maxL,false);
+  pl(sim.g.h,'pc',col('--bad'),1,true);pl(sim.d.h,'pc',col('--accent'),1,true);
+  var lg=sim.g.h[sim.g.h.length-1],ld=sim.d.h[sim.d.h.length-1];
+  $('m1').innerHTML='当前：GRPO 下错误回答平均长度 <b>'+Math.round(lg.wl)+'</b>，Dr. GRPO 下 <b>'+Math.round(ld.wl)+'</b>。在 GRPO 里，同样是答错（优势相同），冗长回答的每个 token 受罚只有简短回答的 '+(len[1]/len[2]).toFixed(2)+' 倍，所以「答错时」的概率质量会从简短错误流向冗长错误——思维链越来越长，其实是错误回答在变长。Dr. GRPO 对所有回答用同一个常数归一化，长短错误回答受到同等惩罚。';
+}
+$('run').onclick=function(){if(timer)return;if(sim.g.h.length>=301)resetSim();timer=setInterval(function(){for(var i=0;i<5;i++){if(sim.g.h.length>=301)break;stepOne(sim.g,'g');stepOne(sim.d,'d');rec(sim.g);rec(sim.d);}render1();if(sim.g.h.length>=301){clearInterval(timer);timer=null;}},30);};
+$('rs').onclick=resetSim;
+$('ls').oninput=resetSim;$('ll').oninput=resetSim;
+
+// ---------- pane 2 ----------
+function draw2(){
+  var p=+$('p').value;$('pv').textContent=p.toFixed(2);
+  var cv=$('c2'),ctx=cv.getContext('2d'),W=cv.width,H=cv.height;ctx.clearRect(0,0,W,H);
+  var x0=36,x1=W-40,y0=H-18,y1=8;
+  ctx.strokeStyle=col('--border');ctx.beginPath();ctx.moveTo(x0,y1);ctx.lineTo(x0,y0);ctx.lineTo(x1,y0);ctx.lineTo(x1,y1);ctx.stroke();
+  ctx.fillStyle=col('--muted');ctx.font='11px sans-serif';
+  ctx.fillText('1.0',8,y1+8);ctx.fillText('0',24,y0);ctx.fillText('p=0',x0-6,H-4);ctx.fillText('p=1',x1-14,H-4);ctx.fillText('10×',x1+4,y1+8);ctx.fillText('0',x1+4,y0);
+  function X(q){return x0+(x1-x0)*q;}
+  function curve(f,c,scale,dash){ctx.strokeStyle=c;ctx.lineWidth=2;ctx.setLineDash(dash?[3,3]:[]);ctx.beginPath();for(var i=1;i<=199;i++){var q=i/200,v=f(q)/scale;v=Math.min(v,1);var y=y0-(y0-y1)*v;if(i>1)ctx.lineTo(X(q),y);else ctx.moveTo(X(q),y);}ctx.stroke();ctx.setLineDash([]);ctx.lineWidth=1;}
+  curve(function(q){return 2*Math.sqrt(q*(1-q));},col('--bad'),1,false);
+  curve(function(q){return 2*q*(1-q);},col('--accent'),1,false);
+  curve(function(q){return 1/Math.sqrt(q*(1-q));},col('--purple'),10,true);
+  ctx.strokeStyle=col('--warn');ctx.beginPath();ctx.moveTo(X(p),y0);ctx.lineTo(X(p),y1);ctx.stroke();
+  var sg=2*Math.sqrt(p*(1-p)),mo=2*p*(1-p),ratio=1/Math.sqrt(p*(1-p));
+  var aC=(1-p)/Math.sqrt(p*(1-p)),aW=-p/Math.sqrt(p*(1-p));
+  $('m2').innerHTML='p = '+p.toFixed(2)+'：组内标准差 √(p(1−p)) = '+Math.sqrt(p*(1-p)).toFixed(3)+'。<br>GRPO 下答对者优势 <b style="color:var(--good)">+'+aC.toFixed(2)+'</b>，答错者 <b style="color:var(--bad)">'+aW.toFixed(2)+'</b>；只减均值时分别是 +'+(1-p).toFixed(2)+' 和 '+(-p).toFixed(2)+'。<br>这道题的总更新强度：GRPO <b>'+sg.toFixed(3)+'</b>，只减均值 <b>'+mo.toFixed(3)+'</b>，GRPO 相对放大了 <b>'+ratio.toFixed(2)+'×</b>（p=0.5 时最小为 2×）。<br>结论：除以标准差相对放大了<b>太简单（p→1）和太难（p→0）</b>的题；两种方式在 p 恰好为 0 或 1 时都归零（全对/全错的组没有学习信号）。';
+}
+$('p').oninput=draw2;
+resetSim();draw2();
+})();
+</script>
+</body>
+</html>

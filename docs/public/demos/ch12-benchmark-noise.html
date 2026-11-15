@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>基准测试的噪声与污染</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#656d76;--card:#f6f8fa;--border:#d0d7de;--accent:#2563eb;--accent2:#ea580c;--good:#16a34a;--bad:#dc2626;--grid:#e5e7eb}
+@media (prefers-color-scheme: dark){:root{--bg:#1b1b1f;--fg:#e6edf3;--muted:#9aa4af;--card:#24262b;--border:#3a3f47;--accent:#60a5fa;--accent2:#fb923c;--good:#4ade80;--bad:#f87171;--grid:#30363d}}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+h3{margin:0 0 4px;font-size:16px}
+.muted{color:var(--muted);font-size:12.5px}
+.controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px 16px;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin:8px 0}
+.controls label{display:block;font-size:13px}.controls label input[type=range],.controls label select{display:block;width:100%;margin-top:2px}
+input[type=range]{width:100%}
+button{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px}
+svg{width:100%;height:auto;display:block}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:8px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:6px 8px}
+.stat b{display:block;font-size:16px}
+.good{color:var(--good)}.bad{color:var(--bad)}
+</style>
+</head>
+<body>
+<h3>两个模型差 2 个百分点，你的 benchmark 分得出来吗？</h3>
+<div class="muted">每道题模型答对的概率 = 它的真实准确率。把同一个 benchmark "重新抽一套题"测 2000 次，看测得的分差会怎样分布。再加入"测试集污染"：模型 B 的训练数据里混进了一部分测试题（这些题它必然答对）。</div>
+<div class="controls">
+  <label>模型 A 真实准确率：<span id="aV"></span><input id="a" type="range" min="0.3" max="0.95" step="0.01" value="0.72"></label>
+  <label>模型 B 真实准确率：<span id="bV"></span><input id="b" type="range" min="0.3" max="0.95" step="0.01" value="0.70"></label>
+  <label>benchmark 题目数 n：<span id="nV"></span><input id="n" type="range" min="1.3" max="4" step="0.05" value="2.3"></label>
+  <label>B 的测试集污染比例：<span id="cV"></span><input id="c" type="range" min="0" max="0.3" step="0.01" value="0"></label>
+</div>
+<button id="again">重新模拟</button>
+<svg id="plot" viewBox="0 0 680 240"></svg>
+<div class="stats">
+  <div class="stat"><span class="muted">A 的 95% 置信区间半宽</span><b id="ci">-</b></div>
+  <div class="stat"><span class="muted">B 的期望测得分数</span><b id="bm">-</b></div>
+  <div class="stat"><span class="muted">测得"B ≥ A"的概率</span><b id="flip">-</b></div>
+  <div class="stat"><span class="muted">某一次测量结果</span><b id="once">-</b></div>
+</div>
+<p class="muted" id="note"></p>
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  function binom(n,p){ // normal approx for large n, exact for small
+    if(n<=300){let k=0;for(let i=0;i<n;i++)if(Math.random()<p)k++;return k;}
+    let u=0,v=0;while(!u)u=Math.random();while(!v)v=Math.random();
+    const z=Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);
+    return Math.max(0,Math.min(n,Math.round(n*p+z*Math.sqrt(n*p*(1-p)))));
+  }
+  function draw(){
+    const a=+$('a').value,b=+$('b').value,n=Math.round(Math.pow(10,+$('n').value)),c=+$('c').value;
+    $('aV').textContent=(a*100).toFixed(0)+'%';$('bV').textContent=(b*100).toFixed(0)+'%';$('nV').textContent=n;$('cV').textContent=(c*100).toFixed(0)+'%';
+    const bEff=c+(1-c)*b;
+    const T=2000,diffs=[];let flips=0;
+    for(let t=0;t<T;t++){const ka=binom(n,a)/n,kb=binom(n,bEff)/n;const d=ka-kb;diffs.push(d);if(d<=0)flips++;}
+    // histogram
+    const W=680,H=240,ml=40,mr=10,mt=10,mb=34;
+    const X0=-0.3,X1=0.3,bins=60,bw=(X1-X0)/bins;
+    const h=Array(bins).fill(0);for(const d of diffs){const k=Math.floor((d-X0)/bw);if(k>=0&&k<bins)h[k]++;}
+    const hm=Math.max(...h);
+    const sx=x=>ml+(x-X0)/(X1-X0)*(W-ml-mr), sy=y=>mt+(1-y/hm)*(H-mt-mb);
+    let s='';
+    for(let x=-0.3;x<=0.3001;x+=0.1){s+=`<line x1="${sx(x)}" x2="${sx(x)}" y1="${mt}" y2="${H-mb}" stroke="var(--grid)"/><text x="${sx(x)}" y="${H-mb+14}" font-size="10" text-anchor="middle" fill="var(--muted)">${(x*100).toFixed(0)}</text>`;}
+    s+=`<rect x="${ml}" y="${mt}" width="${sx(0)-ml}" height="${H-mt-mb}" fill="var(--bad)" opacity="0.07"/>`;
+    s+=`<text x="${ml+4}" y="${mt+12}" font-size="10" fill="var(--bad)">这一侧：测出来 B 不比 A 差（排名翻转）</text>`;
+    h.forEach((v,k)=>{const x=X0+k*bw;s+=`<rect x="${sx(x)+0.5}" y="${sy(v)}" width="${sx(x+bw)-sx(x)-1}" height="${H-mb-sy(v)}" fill="${x+bw/2<=0?'var(--bad)':'var(--accent)'}" opacity="0.8"/>`;});
+    s+=`<line x1="${sx(a-b)}" x2="${sx(a-b)}" y1="${mt}" y2="${H-mb}" stroke="var(--good)" stroke-width="2" stroke-dasharray="5 3"/><text x="${sx(a-b)+4}" y="${mt+26}" font-size="10" fill="var(--good)">真实差距 ${((a-b)*100).toFixed(0)} 分</text>`;
+    s+=`<text x="${W-mr}" y="${H-2}" font-size="10" text-anchor="end" fill="var(--muted)">测得分差 A − B（百分点），2000 次重复</text>`;
+    $('plot').innerHTML=s;
+    const ci=1.96*Math.sqrt(a*(1-a)/n);
+    $('ci').textContent='±'+(ci*100).toFixed(1)+' 分';
+    $('bm').textContent=(bEff*100).toFixed(1)+'%'+(c>0?`（真实 ${(b*100).toFixed(0)}%）`:'');
+    const fp=flips/T;
+    $('flip').innerHTML=`<span class="${fp>0.05?'bad':'good'}">${(fp*100).toFixed(1)}%</span>`;
+    const d0=diffs[0];
+    $('once').textContent=`A ${(d0>=0?'领先':'落后')} ${Math.abs(d0*100).toFixed(1)} 分`;
+    let note=`n = ${n} 道题时，单个模型的分数本身就有约 ±${(ci*100).toFixed(1)} 分的 95% 置信区间。`;
+    if(fp>0.05) note+=' 分差小于噪声：哪怕 A 真的更强，也有相当概率测出 B 更好。报告结果时应该附上置信区间。';
+    else note+=' 题目足够多，排名比较可靠。';
+    if(c>0) note+=` 污染让 B 的测得分数虚高了 ${((bEff-b)*100).toFixed(1)} 分——这是系统偏差，题目再多也消除不了。`;
+    $('note').textContent=note;
+  }
+  ['a','b','n','c'].forEach(id=>$(id).addEventListener('input',draw));
+  $('again').onclick=draw;
+  draw();
+})();
+</script>
+</body>
+</html>

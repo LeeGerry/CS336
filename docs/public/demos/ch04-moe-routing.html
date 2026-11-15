@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MoE 路由与负载均衡</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#656d76;--card:#f6f8fa;--border:#d0d7de;--accent:#0969da;--bar:#0969da;--hot:#cf222e;--good:#1a7f37;--cellrgb:130,80,223;}
+@media (prefers-color-scheme: dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8d96a0;--card:#161b22;--border:#30363d;--accent:#4493f8;--bar:#4493f8;--hot:#f85149;--good:#3fb950;--cellrgb:163,113,247;}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+.wrap{max-width:760px;margin:0 auto;padding:12px}
+h3{margin:4px 0 8px;font-size:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+button,select{background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:13px;cursor:pointer}
+button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+label{font-size:13px;display:inline-flex;align-items:center;gap:4px;cursor:pointer}
+.ctl{display:flex;align-items:center;gap:6px;font-size:13px;flex:1;min-width:200px}
+.ctl input{flex:1;min-width:0}
+.grid2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}
+@media (max-width:560px){.grid2{grid-template-columns:1fr}}
+.bars{display:flex;align-items:flex-end;gap:4px;height:130px;border-bottom:1px solid var(--border);padding-top:6px;position:relative}
+.bars .b{flex:1;background:var(--bar);border-radius:3px 3px 0 0;position:relative;min-height:1px;transition:height .15s}
+.bars .b.hot{background:var(--hot)}
+.bars .ideal{position:absolute;left:0;right:0;border-top:2px dashed var(--good)}
+.blab{display:flex;gap:4px;font-size:11px;color:var(--muted)}
+.blab div{flex:1;text-align:center}
+.hm{display:grid;gap:2px;font-size:10.5px}
+.hm div{text-align:center;padding:3px 0;border-radius:2px}
+.hm .l{color:var(--muted);text-align:left;white-space:nowrap;background:none}
+canvas{width:100%;display:block;background:var(--bg);border:1px solid var(--border);border-radius:6px}
+.stat{font-size:13px;font-variant-numeric:tabular-nums}
+.small{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h3>MoE 路由玩具模拟：没有负载均衡会怎样？</h3>
+<div class="card">
+  <div class="row" style="margin-bottom:6px">
+    <button id="play" class="on">▶ 训练</button>
+    <button id="s10">走 10 步</button>
+    <button id="reset">重置</button>
+    <label><input type="checkbox" id="lb" checked> 负载均衡损失</label>
+    <label><input type="checkbox" id="cap"> 专家容量限制（会丢 token）</label>
+    <label>top-k <select id="k"><option>1</option><option selected>2</option></select></label>
+  </div>
+  <div class="row">
+    <div class="ctl"><span>均衡系数 α</span><input type="range" id="a" min="0.2" max="3" step="0.1" value="1"><b id="av"></b></div>
+    <div class="ctl"><span>容量因子</span><input type="range" id="cf" min="1" max="2" step="0.25" value="1.25"><b id="cfv"></b></div>
+  </div>
+</div>
+<div class="grid2">
+  <div class="card">
+    <div style="font-weight:600;font-size:13px">每个专家分到的 token 比例（本 batch）</div>
+    <div class="bars" id="bars"></div>
+    <div class="blab" id="blab"></div>
+    <div class="small">绿色虚线 = 完全均匀（1/8）。红色 = 超过均匀值 2 倍的“热门专家”。</div>
+  </div>
+  <div class="card">
+    <div style="font-weight:600;font-size:13px">哪类 token 去了哪个专家</div>
+    <div class="hm" id="hm"></div>
+    <div class="small">颜色越深 = 该类 token 中路由到该专家的比例越高。</div>
+  </div>
+</div>
+<div class="card">
+  <div style="font-weight:600;font-size:13px">“在干活的专家”数量随训练步数变化（有效专家数 = 1 / Σ fᵢ²）</div>
+  <canvas id="cv" width="700" height="150"></canvas>
+  <div class="stat" id="stat" style="margin-top:6px"></div>
+  <div class="small" style="margin-top:4px">这是一个高度简化的玩具：被选中的专家会被“奖励”（路由向量朝该 token 靠拢，模拟“这个专家有用”的梯度信号），这正是“强者愈强”的来源；负载均衡项用的是 Switch Transformer 的 α·N·Σ fᵢ·Pᵢ 的真实梯度。</div>
+</div>
+</div>
+<script>
+// ---------- 纯模拟逻辑 ----------
+function makeSim(seed){
+  var s=seed||7;
+  function rand(){ s=(s*16807)%2147483647; return (s-1)/2147483646; }
+  function gauss(){ var u=rand()||1e-9, v=rand(); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); }
+  var N=8, D=6, TYPES=["标点","数字","中文","英文","代码","日文"], T=64;
+  var common=[]; for(var i=0;i<D;i++) common.push(0.7);
+  var centers=TYPES.map(function(){ var c=[]; for(var i=0;i<D;i++) c.push(common[i]+0.9*gauss()); return c; });
+  var W=[]; for(var e=0;e<N;e++){ var w=[]; for(i=0;i<D;i++) w.push(0.05*gauss()+(e===0?0.03:0)); W.push(w); }
+  var sim={N:N,D:D,TYPES:TYPES,T:T,W:W,step:0,history:[],last:null};
+  sim.run=function(opt){
+    var k=opt.k, toks=[], i, j, e;
+    for(i=0;i<T;i++){ var ty=Math.floor(rand()*TYPES.length), u=[]; for(j=0;j<D;j++) u.push(centers[ty][j]+0.3*gauss()); toks.push({ty:ty,u:u}); }
+    var load=new Array(N).fill(0), P=new Array(N).fill(0), assign=[], dropped=0;
+    var cap = opt.cap ? Math.ceil(opt.cf*T*k/N) : Infinity;
+    var gradW=W.map(function(r){return r.map(function(){return 0;});});
+    var probs=[];
+    toks.forEach(function(t){
+      var z=W.map(function(w){ var a=0; for(var j=0;j<D;j++) a+=w[j]*t.u[j]; return a; });
+      var m=Math.max.apply(null,z), ex=z.map(function(x){return Math.exp(x-m);}), sm=ex.reduce(function(a,b){return a+b;},0);
+      var p=ex.map(function(x){return x/sm;}); probs.push(p);
+      for(var e=0;e<N;e++) P[e]+=p[e]/T;
+      var idx=p.map(function(x,i){return i;}).sort(function(a,b){return p[b]-p[a];}).slice(0,k);
+      var got=[];
+      idx.forEach(function(e){ if(load[e]<cap){ load[e]++; got.push(e); } else dropped++; });
+      assign.push(got);
+      // 主损失的代理信号：被选中且实际处理了的专家，被“奖励”
+      got.forEach(function(e){ for(var j=0;j<D;j++) gradW[e][j]-= p[e]*t.u[j]; });
+    });
+    var f=load.map(function(x){return x/(T*k);});
+    var aux=0;
+    if(opt.lb){
+      for(e=0;e<N;e++) aux+=opt.alpha*N*f[e]*P[e];
+      // dL/dz_{t,j} = alpha*N/T * s_j * (f_j - sum_i f_i s_i)
+      toks.forEach(function(t,ti){
+        var p=probs[ti], fs=0; for(var e2=0;e2<N;e2++) fs+=f[e2]*p[e2];
+        for(var e3=0;e3<N;e3++){ var gz=opt.alpha*N/T*p[e3]*(f[e3]-fs)*T*3; for(var j=0;j<D;j++) gradW[e3][j]+=gz*t.u[j]; }
+      });
+    }
+    var lr=0.02;
+    for(e=0;e<N;e++) for(j=0;j<D;j++){ W[e][j]=W[e][j]*(1-0.002)-lr*gradW[e][j]/T*4; }
+    // 限制路由向量长度，避免 softmax 饱和（真实训练里由归一化、权重衰减等起类似作用）
+    for(e=0;e<N;e++){ var nn=Math.sqrt(W[e].reduce(function(a,x){return a+x*x;},0)); if(nn>2.5) for(j=0;j<D;j++) W[e][j]*=2.5/nn; }
+    var eff=1/f.reduce(function(a,x){return a+x*x;},0);
+    var byType=TYPES.map(function(){return new Array(N).fill(0);}), cnt=new Array(TYPES.length).fill(0);
+    toks.forEach(function(t,ti){ cnt[t.ty]++; assign[ti].forEach(function(e){ byType[t.ty][e]+=1/k; }); });
+    byType=byType.map(function(r,ty){ return r.map(function(x){ return cnt[ty]?x/cnt[ty]:0; }); });
+    sim.step++; sim.history.push(eff);
+    sim.last={f:f,eff:eff,dropped:dropped/(T*k),aux:aux,byType:byType};
+    return sim.last;
+  };
+  return sim;
+}
+/*DOM*/
+(function(){
+  if(typeof document==="undefined") return;
+  var $=function(id){return document.getElementById(id);};
+  function css(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+  var sim=makeSim(7), timer=null;
+  function opt(){ return {k:+$("k").value,lb:$("lb").checked,cap:$("cap").checked,cf:+$("cf").value,alpha:+$("a").value}; }
+  function render(){
+    $("av").textContent=(+$("a").value).toFixed(1); $("cfv").textContent=(+$("cf").value).toFixed(2);
+    var L=sim.last; if(!L) L=sim.run(opt());
+    var N=sim.N, mx=Math.max(0.5,Math.max.apply(null,L.f));
+    var h="<div class='ideal' style='bottom:"+(1/N/mx*100)+"%'></div>";
+    L.f.forEach(function(x){ h+="<div class='b"+(x>2/N?" hot":"")+"' style='height:"+(x/mx*100)+"%' title='"+(x*100).toFixed(1)+"%'></div>"; });
+    $("bars").innerHTML=h;
+    $("blab").innerHTML=L.f.map(function(x,i){return "<div>E"+i+"<br>"+(x*100).toFixed(0)+"%</div>";}).join("");
+    var hm=$("hm"); hm.style.gridTemplateColumns="36px repeat("+N+",minmax(0,1fr))";
+    var s="<div class='l'></div>"; for(var e=0;e<N;e++) s+="<div class='l' style='text-align:center'>E"+e+"</div>";
+    var rgb=css("--cellrgb");
+    L.byType.forEach(function(r,ty){ s+="<div class='l'>"+sim.TYPES[ty]+"</div>"; r.forEach(function(x){ s+="<div style='background:rgba("+rgb+","+Math.min(1,x*1.3)+");color:"+(x>0.45?"#fff":"inherit")+"'>"+(x>=0.005?Math.round(x*100):"")+"</div>"; }); });
+    hm.innerHTML=s;
+    drawLine();
+    $("stat").innerHTML="第 <b>"+sim.step+"</b> 步　有效专家数 <b>"+L.eff.toFixed(2)+"</b> / "+N+"　最忙专家占比 <b>"+(Math.max.apply(null,L.f)*100).toFixed(0)+"%</b>"+($("cap").checked?"　被丢弃的 token 分配 <b style='color:var(--hot)'>"+(L.dropped*100).toFixed(1)+"%</b>":"")+($("lb").checked?"　均衡损失 "+L.aux.toFixed(3)+"（完全均匀时 ≈ α = "+(+$("a").value).toFixed(1)+"）":"");
+  }
+  function drawLine(){
+    var c=$("cv"), dpr=window.devicePixelRatio||1, W=c.clientWidth, H=150;
+    c.width=W*dpr; c.height=H*dpr; c.style.height=H+"px";
+    var ctx=c.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H);
+    var hs=sim.history, n=Math.max(100,hs.length), Lp=28, B=16, T=8;
+    ctx.font="11px sans-serif"; ctx.fillStyle=css("--muted"); ctx.strokeStyle=css("--border");
+    [1,4,8].forEach(function(v){ var y=T+(1-v/8)*(H-T-B); ctx.beginPath(); ctx.moveTo(Lp,y); ctx.lineTo(W-4,y); ctx.stroke(); ctx.fillText(String(v),8,y+4); });
+    ctx.fillText("步数 →",W-50,H-3);
+    ctx.strokeStyle=css("--accent"); ctx.lineWidth=2; ctx.beginPath();
+    hs.forEach(function(v,i){ var x=Lp+i/n*(W-Lp-4), y=T+(1-v/8)*(H-T-B); if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); });
+    ctx.stroke();
+  }
+  function stepN(m){ for(var i=0;i<m;i++) sim.run(opt()); render(); }
+  $("play").onclick=function(){
+    var b=this;
+    if(timer){ clearInterval(timer); timer=null; b.textContent="▶ 训练"; return; }
+    b.textContent="⏸ 暂停";
+    timer=setInterval(function(){ stepN(2); if(sim.step>=600){ clearInterval(timer); timer=null; b.textContent="▶ 训练"; } },60);
+  };
+  $("s10").onclick=function(){ stepN(10); };
+  $("reset").onclick=function(){ sim=makeSim(7); sim.run(opt()); render(); };
+  ["lb","cap","k","a","cf"].forEach(function(id){ $(id).onchange=render; $(id).oninput=render; });
+  window.addEventListener("resize",drawLine);
+  sim.run(opt()); render();
+})();
+</script>
+</body>
+</html>

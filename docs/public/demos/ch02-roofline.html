@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>算术强度与 Roofline</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#6b7280;--card:#f5f7fa;--border:#d8dee4;--accent:#2563eb;--roof:#334155;--pt:#94a3b8;--cur:#dc2626;--mem:#d97706;--comp:#059669}
+@media (prefers-color-scheme: dark){:root{--bg:#16181d;--fg:#e6e8eb;--muted:#9aa3ae;--card:#1f232a;--border:#363c45;--accent:#60a5fa;--roof:#cbd5e1;--pt:#64748b;--cur:#f87171;--mem:#fbbf24;--comp:#34d399}}
+*{box-sizing:border-box}
+select{max-width:100%}
+label{max-width:100%}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+body{padding:12px;overflow-x:hidden}
+h3{margin:0 0 6px;font-size:16px}
+.muted{color:var(--muted);font-size:12.5px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin:8px 0}
+select{font:inherit;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg)}
+input[type=range]{flex:1;min-width:120px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
+canvas{width:100%;height:280px;display:block;border:1px solid var(--border);border-radius:8px;background:var(--bg)}
+.stat{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:6px}
+.stat div{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 8px}
+.stat b{display:block;font-size:15px}
+.steps{white-space:pre-wrap;line-height:1.7;margin-top:6px}
+.memb{color:var(--mem);font-weight:700}.compb{color:var(--comp);font-weight:700}
+</style>
+</head>
+<body>
+<h3>算术强度：这个运算是“搬数据慢”还是“算得慢”？</h3>
+<div class="row">
+  <label>运算 <select id="op">
+    <option value="relu">ReLU（逐元素）</option>
+    <option value="gelu">GELU（逐元素，约 20 FLOPs/元素）</option>
+    <option value="dot">点积 x·w（两个长 n 向量）</option>
+    <option value="mv">矩阵×向量（n×n 乘 n）</option>
+    <option value="mm" selected>矩阵×矩阵（n×n 乘 n×n）</option>
+  </select></label>
+  <label>硬件 <select id="hw">
+    <option value="h100">H100</option>
+    <option value="b200">B200</option>
+  </select></label>
+  <label>精度 <select id="dt">
+    <option value="2">bf16（2 字节）</option>
+    <option value="4">fp32（4 字节）</option>
+  </select></label>
+</div>
+<div class="row">
+  <label>n = <b id="nv" class="mono"></b></label>
+  <input id="n" type="range" min="4" max="24" step="1" value="10">
+</div>
+<canvas id="cv"></canvas>
+<div class="card">
+  <div class="stat">
+    <div>搬运字节数<b id="oB" class="mono"></b></div>
+    <div>浮点运算数<b id="oF" class="mono"></b></div>
+    <div>算术强度 FLOPs/字节<b id="oAI" class="mono"></b></div>
+    <div>硬件强度 FLOP/s ÷ B/s<b id="oHI" class="mono"></b></div>
+    <div>瓶颈<b id="oBot"></b></div>
+    <div>MFU 上限<b id="oMFU" class="mono"></b></div>
+  </div>
+  <div class="steps mono muted" id="steps"></div>
+</div>
+<div class="muted">图是双对数坐标的 roofline：斜线部分受内存带宽限制（越往右越快），平顶部分受算力限制。灰点是其它运算在同一个 n 下的位置，红点是当前运算。把 n 拉小，矩阵乘法也会掉到“内存瓶颈”区。</div>
+<script>
+(function(){
+  var $=function(id){return document.getElementById(id);};
+  var HW={h100:{bf:989.5e12,fp32:67.5e12,bw:3.35e12,name:'H100'},b200:{bf:2250e12,fp32:75e12,bw:8e12,name:'B200'}};
+  var NAMES={relu:'ReLU',gelu:'GELU',dot:'点积',mv:'矩阵×向量',mm:'矩阵乘法'};
+  function cost(op,n,b){
+    switch(op){
+      case 'relu': return {bytes:b*n+b*n, flops:n, why:'读 x（'+b+'n）+ 写 y（'+b+'n）；每个元素比较 1 次'};
+      case 'gelu': return {bytes:b*n+b*n, flops:20*n, why:'读 x + 写 y；每元素约 20 次运算（tanh 近似）'};
+      case 'dot': return {bytes:b*n+b*n+b, flops:2*n-1, why:'读 x、读 w（各 '+b+'n）+ 写 1 个标量；n 次乘 + (n−1) 次加'};
+      case 'mv': return {bytes:b*n+b*n*n+b*n, flops:n*(2*n-1), why:'读 x（'+b+'n）+ 读 W（'+b+'n²）+ 写 y（'+b+'n）；n 个点积'};
+      case 'mm': return {bytes:3*b*n*n, flops:n*n*(2*n-1), why:'读 X、读 W、写 Y，各 '+b+'n²；n² 个点积，每个 2n−1 次运算'};
+    }
+  }
+  function maxExp(op){ return (op==='mv'||op==='mm')?14:24; }
+  function sci(x){ var e=Math.floor(Math.log10(Math.abs(x))); var m=x/Math.pow(10,e); return m.toFixed(2)+'e'+e; }
+  function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
+  var cv=$('cv'), ctx=cv.getContext('2d'), W=0, H=0;
+  function resize(){ var r=cv.getBoundingClientRect(), d=window.devicePixelRatio||1; W=r.width;H=r.height; cv.width=Math.round(W*d); cv.height=Math.round(H*d); ctx.setTransform(d,0,0,d,0,0); update(); }
+  function update(){
+    var op=$('op').value, hw=HW[$('hw').value], b=+$('dt').value;
+    var nmax=maxExp(op); $('n').max=nmax; if(+$('n').value>nmax) $('n').value=nmax;
+    var n=Math.pow(2,+$('n').value); $('nv').textContent='2^'+$('n').value+' = '+n.toLocaleString();
+    var peak=b===2?hw.bf:hw.fp32, bw=hw.bw, hi=peak/bw;
+    var c=cost(op,n,b), ai=c.flops/c.bytes;
+    var tm=c.bytes/bw, tc=c.flops/peak, mem=tm>tc;
+    $('oB').textContent=sci(c.bytes); $('oF').textContent=sci(c.flops); $('oAI').textContent=ai.toFixed(2); $('oHI').textContent=hi.toFixed(0);
+    $('oBot').innerHTML=mem?'<span class="memb">内存瓶颈</span>':'<span class="compb">计算瓶颈</span>';
+    $('oMFU').textContent=(Math.min(1,ai/hi)*100).toFixed(1)+'%';
+    $('steps').textContent=c.why+'\n'+
+      '搬运时间 = '+sci(c.bytes)+' B ÷ '+sci(bw)+' B/s = '+sci(tm)+' s\n'+
+      '计算时间 = '+sci(c.flops)+' ÷ '+sci(peak)+' FLOP/s = '+sci(tc)+' s\n'+
+      '假设搬运与计算完美重叠：总时间 ≈ max(两者) = '+sci(Math.max(tm,tc))+' s\n'+
+      '算术强度 '+ai.toFixed(2)+(mem?' < ':' > ')+'硬件强度 '+hi.toFixed(0)+' → '+(mem?'内存瓶颈（算力在等数据）':'计算瓶颈（算力被喂饱了）');
+    draw(op,n,b,peak,bw);
+  }
+  function draw(op,n,b,peak,bw){
+    ctx.clearRect(0,0,W,H);
+    var PL=48,PR=10,PT=12,PB=30, x0=-1, x1=4.5, yTop=Math.log10(peak)+0.4, yBot=yTop-5.4;
+    function sx(l){return PL+(l-x0)/(x1-x0)*(W-PL-PR);} function sy(l){return PT+(yTop-l)/(yTop-yBot)*(H-PT-PB);}
+    ctx.strokeStyle=css('--border'); ctx.fillStyle=css('--muted'); ctx.font='11px sans-serif'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(PL,PT); ctx.lineTo(PL,H-PB); ctx.lineTo(W-PR,H-PB); ctx.stroke();
+    ctx.textAlign='center'; for(var e=Math.ceil(x0);e<=x1;e++){ ctx.fillText('10^'+e,sx(e),H-PB+13); }
+    ctx.fillText('算术强度（FLOPs/字节，对数）',(PL+W-PR)/2,H-4);
+    ctx.textAlign='right'; for(var y=Math.ceil(yBot);y<=yTop;y++){ ctx.fillText('1e'+y,PL-4,sy(y)+4); }
+    ctx.save(); ctx.translate(11,(PT+H-PB)/2); ctx.rotate(-Math.PI/2); ctx.textAlign='center'; ctx.fillText('可达 FLOP/s',0,0); ctx.restore();
+    // roof
+    var knee=Math.log10(peak/bw);
+    ctx.strokeStyle=css('--roof'); ctx.lineWidth=2.2; ctx.beginPath();
+    var ls=x0, lv=Math.log10(bw)+ls; ctx.moveTo(sx(ls),sy(lv)); ctx.lineTo(sx(knee),sy(Math.log10(peak))); ctx.lineTo(sx(x1),sy(Math.log10(peak))); ctx.stroke();
+    ctx.setLineDash([3,3]); ctx.strokeStyle=css('--muted'); ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(sx(knee),sy(Math.log10(peak))); ctx.lineTo(sx(knee),H-PB); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle=css('--muted'); ctx.textAlign='left'; ctx.fillText('拐点 ≈ '+(peak/bw).toFixed(0),sx(knee)+4,H-PB-6);
+    ctx.fillStyle=css('--mem'); ctx.fillText('内存瓶颈区',sx(x0)+6,sy(Math.log10(bw)+x0)-8);
+    ctx.fillStyle=css('--comp'); ctx.textAlign='right'; ctx.fillText('计算瓶颈区',W-PR-4,sy(Math.log10(peak))-6);
+    // points
+    var ops=['relu','gelu','dot','mv','mm'];
+    ops.forEach(function(o){
+      var nn=Math.min(n,Math.pow(2,maxExp(o)));
+      var c=cost(o,nn,b), ai=c.flops/c.bytes, perf=Math.min(peak,ai*bw), lx=Math.log10(ai), ly=Math.log10(perf);
+      if(lx<x0||lx>x1) return;
+      var cur=(o===op);
+      ctx.fillStyle=cur?css('--cur'):css('--pt');
+      ctx.beginPath(); ctx.arc(sx(lx),sy(ly),cur?6:4,0,7); ctx.fill();
+      ctx.fillStyle=cur?css('--cur'):css('--muted'); ctx.textAlign='left'; ctx.font=(cur?'bold ':'')+'11px sans-serif';
+      ctx.fillText(NAMES[o],sx(lx)+7,sy(ly)+(o==='gelu'?-6:12)); ctx.font='11px sans-serif';
+    });
+  }
+  ['op','hw','dt'].forEach(function(id){$(id).onchange=update;}); $('n').oninput=update;
+  window.addEventListener('resize',resize); resize();
+})();
+</script>
+</body>
+</html>

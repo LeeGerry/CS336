@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GRPO 循环</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#656d76;--card:#f6f8fa;--border:#d0d7de;--accent:#2563eb;--good:#16a34a;--bad:#dc2626;--warn:#d97706;--off:#e5e7eb}
+@media (prefers-color-scheme: dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8b949e;--card:#161b22;--border:#30363d;--accent:#58a6ff;--good:#4ade80;--bad:#f87171;--warn:#f59e0b;--off:#21262d}}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+h3{margin:0 0 6px;font-size:16px}
+.ctrl{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:6px 14px;margin-bottom:8px;font-size:13px}
+.ctrl label{display:flex;align-items:center;gap:6px;white-space:nowrap}
+.ctrl select{flex:1;min-width:0;max-width:100%}
+input[type=range]{flex:1;min-width:60px}
+select,button{font:inherit;padding:4px 10px;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--fg);cursor:pointer}
+button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px}
+.phases{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:8px}
+.ph{flex:1;min-width:70px;text-align:center;font-size:12px;padding:4px;border-radius:5px;background:var(--off);color:var(--muted)}
+.ph.on{background:var(--accent);color:#fff}
+.pol{display:grid;grid-template-columns:minmax(110px,170px) 1fr 92px;gap:4px 6px;align-items:center;font-size:12px}
+.track{height:16px;background:var(--bg);border:1px solid var(--border);border-radius:4px;overflow:hidden;position:relative}
+.fill{height:100%;background:var(--accent);transition:width .4s}
+.ghost{position:absolute;top:0;height:100%;border-right:2px dashed var(--warn)}
+.num{font-variant-numeric:tabular-nums;text-align:right}
+.up{color:var(--good)}.down{color:var(--bad)}
+.group{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:6px}
+.resp{border:1px solid var(--border);border-radius:6px;padding:5px 6px;background:var(--bg);font-size:11.5px;opacity:0;transform:translateY(6px);transition:opacity .3s,transform .3s}
+.resp.show{opacity:1;transform:none}
+.resp code{font-size:11px;word-break:break-all;display:block;color:var(--muted);min-height:30px}
+.tag{display:inline-block;padding:0 5px;border-radius:4px;font-size:11px;margin-right:3px;background:var(--off)}
+.tag.g{background:var(--good);color:#fff}.tag.b{background:var(--bad);color:#fff}
+.stats{font-size:13px;margin:6px 0}
+canvas{width:100%;height:110px;display:block}
+.note{font-size:12px;color:var(--muted)}
+#msg{font-size:13px;min-height:40px}
+</style>
+</head>
+<body>
+<h3>GRPO：一道题采样一组回答 → 可验证奖励 → 组内归一化 → 更新</h3>
+<div class="ctrl">
+  <label>题目 <select id="q">
+    <option value="0">简单：7 + 8 = ?</option>
+    <option value="1" selected>中等：12 × 13 = ?</option>
+    <option value="2">困难：17 × 23 − 89 = ?</option>
+  </select></label>
+  <label>组大小 G <input type="range" id="G" min="2" max="16" value="8"><b id="Gv">8</b></label>
+  <label>正确性奖励 <input type="range" id="rc" min="0" max="2" step="0.1" value="1"><b id="rcv">1.0</b></label>
+  <label>格式奖励 <input type="range" id="rf" min="0" max="1" step="0.1" value="0"><b id="rfv">0.0</b></label>
+  <label>答案检查器 <select id="chk"><option value="strict">严格（只认标签内阿拉伯数字）</option><option value="loose">宽松（也认中文数字/无标签）</option></select></label>
+  <label>优势计算 <select id="adv"><option value="grpo">GRPO：除以标准差</option><option value="dr">Dr. GRPO：只减均值</option></select></label>
+  <label>学习率 <input type="range" id="lr" min="0.2" max="4" step="0.2" value="0.6"><b id="lrv">0.6</b></label>
+</div>
+<div class="row">
+  <button class="primary" id="next">下一步：采样</button>
+  <button id="round">完整跑一轮</button>
+  <button id="auto">▶ 自动训练</button>
+  <button id="reset">重置</button>
+  <span class="note">已更新 <b id="it">0</b> 轮</span>
+</div>
+<div class="phases"><div class="ph" id="p0">① 采样 G 个回答</div><div class="ph" id="p1">② 验证器打分</div><div class="ph" id="p2">③ 组内归一化得优势</div><div class="ph" id="p3">④ 更新策略概率</div></div>
+<div class="card" id="msg">点「下一步」开始。模型（策略）在这道题上只会产生 6 类回答，下方条形是它产生每类回答的概率。</div>
+<div class="card">
+  <div style="font-size:13px;margin-bottom:4px"><b>策略 π_θ</b>（虚线 = 更新前的位置）</div>
+  <div class="pol" id="pol"></div>
+</div>
+<div class="card">
+  <div style="font-size:13px"><b>本组采样</b> <span class="stats" id="gstat"></span></div>
+  <div class="group" id="group"></div>
+</div>
+<div class="card">
+  <div style="font-size:13px"><span style="color:var(--good)">━ 真正答对的概率</span>　<span style="color:var(--warn)">━ 期望奖励（验证器眼中）</span></div>
+  <canvas id="cv" width="640" height="110"></canvas>
+</div>
+<div class="note">简化：真实 LLM 的策略是对整段文本的分布，这里把它压缩成 6 类回答的 softmax；更新规则就是在线 GRPO（ρ=1，无裁剪）的策略梯度：θ_k += lr · (1/G)·Σ_i A_i·(1[y_i=k] − π_k)，省略了 KL 项。</div>
+<script>
+(function(){
+var Q=[{a:15,cn:'十五',calc:'7+8=15',wrong1:'7+8=14',w1:14,w2:16,approx:'7+8≈16'},
+       {a:156,cn:'一百五十六',calc:'12×13=120+36=156',wrong1:'12×13=120+3=123',w1:123,w2:150,approx:'12×13≈150'},
+       {a:302,cn:'三百零二',calc:'17×23=391，391−89=302',wrong1:'17×23=381，381−89=292',w1:292,w2:312,approx:'17×23≈400，减89≈312'}];
+var INIT=[[0.55,0.15,0.10,0.08,0.04,0.08],[0.20,0.10,0.25,0.25,0.10,0.10],[0.03,0.02,0.36,0.36,0.18,0.05]];
+var TYPES=['正确 + 格式规范','正确但没用标签','计算失误','粗略估算','啰嗦不收尾','正确但写中文数字'];
+var th,phase,grp,stats,prevP,iter,hist,timer=null;
+function $(i){return document.getElementById(i);}
+function q(){return Q[+$('q').value];}
+function probs(){var m=Math.max.apply(null,th),e=th.map(function(t){return Math.exp(t-m);}),s=e.reduce(function(a,b){return a+b;},0);return e.map(function(x){return x/s;});}
+function text(k){var Z=q();return [
+ '<think>'+Z.calc+'</think><answer>'+Z.a+'</answer>',
+ '答案是 '+Z.a,
+ '<think>'+Z.wrong1+'</think><answer>'+Z.w1+'</answer>',
+ '<think>'+Z.approx+'</think><answer>'+Z.w2+'</answer>',
+ '<think>嗯……让我再想想……再想想……',
+ '<think>'+Z.calc+'</think><answer>'+Z.cn+'</answer>'][k];}
+function truly(k){return k===0||k===1||k===5;}
+function verify(k){
+  var loose=$('chk').value==='loose';
+  var fmt=(k===0||k===2||k===3||k===5);
+  var correct=(k===0)||(loose&&(k===1||k===5));
+  return {fmt:fmt,correct:correct,r:(+$('rc').value)*(correct?1:0)+(+$('rf').value)*(fmt?1:0)};
+}
+function sample(p){var u=Math.random(),c=0;for(var i=0;i<p.length;i++){c+=p[i];if(u<c)return i;}return p.length-1;}
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function reset(){stopAuto();th=INIT[+$('q').value].map(Math.log);phase=0;grp=[];stats=null;prevP=null;iter=0;hist=[metrics()];renderAll();setMsg('点「下一步」开始。模型（策略）在这道题上只会产生 6 类回答，下方条形是它产生每类回答的概率。');}
+function metrics(){var p=probs(),tc=0,er=0;for(var k=0;k<6;k++){if(truly(k))tc+=p[k];er+=p[k]*verify(k).r;}return {tc:tc,er:er};}
+function setMsg(h){$('msg').innerHTML=h;}
+function doPhase(silent){
+  var G=+$('G').value,p=probs();
+  if(phase===0){
+    grp=[];for(var i=0;i<G;i++)grp.push({k:sample(p)});stats=null;prevP=null;
+    if(!silent)setMsg('① 用当前策略对<b>同一道题</b>采样 '+G+' 个回答（温度 1）。注意：同一类回答可能被采到多次，低概率的回答也可能被采到——这就是探索。');
+  }else if(phase===1){
+    grp.forEach(function(g){var v=verify(g.k);g.v=v;g.r=v.r;});
+    if(!silent)setMsg('② 验证器逐个检查：答案对不对（'+($('chk').value==='strict'?'严格检查器只认 answer 标签里的阿拉伯数字':'宽松检查器也接受中文数字和没有标签的答案')+'）'+(+$('rf').value>0?'，以及是否使用了 think/answer 格式':'')+'。不需要奖励模型，规则就能判。');
+  }else if(phase===2){
+    var rs=grp.map(function(g){return g.r;}),m=rs.reduce(function(a,b){return a+b;},0)/G;
+    var sd=Math.sqrt(rs.reduce(function(a,b){return a+(b-m)*(b-m);},0)/G);
+    grp.forEach(function(g){g.A=$('adv').value==='grpo'?(g.r-m)/(sd+1e-4):(g.r-m);});
+    stats={m:m,sd:sd};
+    var allSame=sd<1e-9;
+    if(!silent)setMsg('③ 组内均值 = '+m.toFixed(3)+'，标准差 = '+sd.toFixed(3)+'。每个回答的优势 = 它比组内平均好多少'+($('adv').value==='grpo'?'，再除以标准差':'')+'。'+(allSame?' <b style="color:var(--bad)">这一组奖励全部相同 → 优势全是 0 → 这道题这一轮学不到任何东西！</b>（试试换难度或增大 G）':' 高于平均的是正优势（绿色），低于平均的是负优势（红色）。'));
+  }else{
+    prevP=p.slice();var lr=+$('lr').value,g=[0,0,0,0,0,0];
+    grp.forEach(function(x){for(var k=0;k<6;k++)g[k]+=x.A*((k===x.k?1:0)-p[k]);});
+    for(var k=0;k<6;k++)th[k]+=lr*g[k]/G;
+    iter++;hist.push(metrics());
+    if(!silent)setMsg('④ 策略梯度更新：正优势的回答概率被推高，负优势的被压低（相当于按优势加权的 SFT，权重可正可负）。虚线是更新前的位置。点「下一步」开始新一轮。');
+  }
+  phase=(phase+1)%4;
+}
+function renderAll(){
+  var p=probs(),pol=$('pol');pol.innerHTML='';
+  for(var k=0;k<6;k++){
+    var d=prevP?(p[k]-prevP[k]):0;
+    var v=verify(k);
+    var lab=document.createElement('div');lab.innerHTML=TYPES[k]+' <span class="tag '+(truly(k)?'g':'b')+'">'+(truly(k)?'真对':'真错')+'</span>';
+    var tr=document.createElement('div');tr.className='track';
+    tr.innerHTML='<div class="fill" style="width:'+(p[k]*100)+'%"></div>'+(prevP?'<div class="ghost" style="width:'+(prevP[k]*100)+'%"></div>':'');
+    var nm=document.createElement('div');nm.className='num';
+    nm.innerHTML=(p[k]*100).toFixed(1)+'% '+(prevP&&Math.abs(d)>0.0005?'<span class="'+(d>0?'up':'down')+'">'+(d>0?'▲':'▼')+Math.abs(d*100).toFixed(1)+'</span>':'');
+    pol.appendChild(lab);pol.appendChild(tr);pol.appendChild(nm);
+  }
+  var box=$('group');box.innerHTML='';
+  grp.forEach(function(g,i){
+    var c=document.createElement('div');c.className='resp';
+    var h='<div><b>#'+(i+1)+'</b> '+TYPES[g.k]+'</div><code>'+esc(text(g.k))+'</code>';
+    if(g.v){h+='<span class="tag '+(g.v.correct?'g':'b')+'">'+(g.v.correct?'判对':'判错')+'</span>';if(+$('rf').value>0)h+='<span class="tag '+(g.v.fmt?'g':'b')+'">格式'+(g.v.fmt?'✓':'✗')+'</span>';h+=' r = '+g.r.toFixed(1);}
+    if(g.A!==undefined){h+='<div>优势 A = <b style="color:'+(g.A>1e-9?'var(--good)':(g.A<-1e-9?'var(--bad)':'var(--muted)'))+'">'+(g.A>=0?'+':'')+g.A.toFixed(2)+'</b></div>';}
+    c.innerHTML=h;if(timer)c.classList.add('show');box.appendChild(c);
+    if(!timer)setTimeout(function(){c.classList.add('show');},30+i*40);
+  });
+  $('gstat').textContent=stats?('均值 '+stats.m.toFixed(3)+' · 标准差 '+stats.sd.toFixed(3)):(grp.length?'（'+grp.length+' 个回答）':'');
+  for(var i=0;i<4;i++)$('p'+i).classList.toggle('on',grp.length>0&&i===(phase+3)%4);
+  $('next').textContent='下一步：'+['采样','打分','归一化','更新'][phase];
+  $('it').textContent=iter;
+  ['G','rc','rf','lr'].forEach(function(id){$(id+'v').textContent=id==='G'?$(id).value:(+$(id).value).toFixed(1);});
+  draw();
+}
+function draw(){
+  var cv=$('cv'),ctx=cv.getContext('2d'),W=cv.width,H=cv.height,cs=getComputedStyle(document.body);
+  ctx.clearRect(0,0,W,H);
+  ctx.strokeStyle=cs.getPropertyValue('--border');ctx.beginPath();ctx.moveTo(28,4);ctx.lineTo(28,H-14);ctx.lineTo(W-4,H-14);ctx.stroke();
+  ctx.fillStyle=cs.getPropertyValue('--muted');ctx.font='11px sans-serif';ctx.fillText('1',14,12);ctx.fillText('0',14,H-14);
+  var n=Math.max(hist.length,30),mx=Math.max(1,(+$('rc').value)+(+$('rf').value));
+  function line(key,col,scale){ctx.strokeStyle=col;ctx.lineWidth=2;ctx.beginPath();hist.forEach(function(h,i){var x=28+(W-34)*i/(n-1),y=(H-14)-(H-20)*h[key]/scale;if(i)ctx.lineTo(x,y);else ctx.moveTo(x,y);});ctx.stroke();}
+  line('tc',cs.getPropertyValue('--good'),1);line('er',cs.getPropertyValue('--warn'),mx);ctx.lineWidth=1;
+}
+function round(){var start=phase;do{doPhase(true);}while(phase!==0);if(start!==0){}setMsg('完整跑完一轮（采样→打分→归一化→更新）。看看哪些回答的概率上升了。');renderAll();}
+function stopAuto(){if(timer){clearInterval(timer);timer=null;$('auto').textContent='▶ 自动训练';}}
+$('next').onclick=function(){stopAuto();doPhase(false);renderAll();};
+$('round').onclick=function(){stopAuto();if(phase!==0){while(phase!==0)doPhase(true);renderAll();}else round();};
+$('auto').onclick=function(){if(timer){stopAuto();return;}this.textContent='⏸ 暂停';timer=setInterval(function(){while(phase!==0)doPhase(true);do{doPhase(true);}while(phase!==0);setMsg('自动训练中……观察绿色曲线（真正答对）与橙色曲线（验证器给的期望奖励）。试试把检查器改成「宽松」或加大格式奖励，看看模型学到了什么。');renderAll();if(iter>=150)stopAuto();},160);};
+$('reset').onclick=reset;$('q').onchange=reset;
+['G','rc','rf','lr'].forEach(function(id){$(id).oninput=function(){renderAll();};});
+['chk','adv'].forEach(function(id){$(id).onchange=function(){hist.push(metrics());renderAll();};});
+reset();
+})();
+</script>
+</body>
+</html>

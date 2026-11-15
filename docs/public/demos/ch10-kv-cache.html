@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prefill 与 KV Cache</title>
+<style>
+:root{ --bg:#ffffff; --panel:#f5f6f8; --fg:#1d2330; --muted:#667085; --line:#d0d5dd; --accent:#2563eb; --track:#e5e7eb;
+  --k:#2563eb; --v:#0891b2; --new:#f59e0b; --read:#fde68a; --w:#94a3b8; --good:#16a34a; --bad:#dc2626; --kv:#9333ea; }
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#111418; --panel:#1b2027; --fg:#e6e9ef; --muted:#98a2b3; --line:#344054; --accent:#60a5fa; --track:#2a313c;
+    --k:#3b82f6; --v:#06b6d4; --new:#fbbf24; --read:#78591a; --w:#64748b; --good:#4ade80; --bad:#f87171; --kv:#a855f7; }
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;font-size:14px}
+.wrap{max-width:760px;margin:0 auto;padding:12px}
+h1{font-size:16px;margin:0 0 6px} h2{font-size:15px;margin:16px 0 6px}
+button{font:inherit;border:1px solid var(--line);background:var(--panel);color:var(--fg);padding:5px 10px;border-radius:6px;cursor:pointer}
+button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+button:disabled{opacity:.45;cursor:not-allowed}
+.grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px 12px}
+@media (max-width:560px){ .grid{grid-template-columns:1fr 1fr} }
+label{display:block;font-size:12px;color:var(--muted);margin-bottom:2px}
+label b{color:var(--fg)}
+input[type=range],select{width:100%}
+select{font:inherit;font-size:13px;padding:3px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--fg)}
+svg{width:100%;height:auto;display:block;background:var(--panel);border-radius:10px}
+.ctrl{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0;align-items:center}
+.card{background:var(--panel);border-radius:10px;padding:10px;margin-top:8px;font-size:13px;line-height:1.65}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px}
+@media (max-width:560px){ .stats{grid-template-columns:repeat(2,1fr)} }
+.stat{background:var(--panel);border-radius:8px;padding:6px 8px;font-size:11.5px;color:var(--muted)}
+.stat b{display:block;color:var(--fg);font-size:14px}
+.membar{height:22px;background:var(--track);border-radius:6px;position:relative;overflow:hidden;margin-top:6px}
+.membar div{position:absolute;top:0;bottom:0}
+.lim{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--fg)}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+td{padding:3px 4px;border-bottom:1px solid var(--line)} td:last-child{text-align:right;font-variant-numeric:tabular-nums}
+.ok{color:var(--good);font-weight:700}.no{color:var(--bad);font-weight:700}
+.muted{color:var(--muted);font-size:12px}
+.tag{display:inline-block;padding:1px 7px;border-radius:10px;font-size:12px;color:#fff}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>推理的两个阶段：Prefill（预填充）与 Decode（逐个生成）</h1>
+  <div class="grid">
+    <div><label>模型</label><select id="model"></select></div>
+    <div><label>并发请求数 B：<b id="vB"></b></label><input id="B" type="range" min="0" max="9" value="0"></div>
+    <div><label>提示词长度 S：<b id="vS"></b></label><input id="S" type="range" min="7" max="15" value="10"></div>
+  </div>
+
+  <h2>① 动画：KV cache 是怎么长出来的</h2>
+  <svg id="anim" viewBox="0 0 700 300"></svg>
+  <div class="ctrl">
+    <button id="bReset">⟲ 重置</button><button id="bStep">单步 ▶</button><button id="bPlay">▶ 自动播放</button>
+    <span id="phase" class="muted"></span>
+  </div>
+  <div class="card" id="explain"></div>
+  <div class="stats" id="stepStats"></div>
+
+  <h2>② 显存与速度计算器（每生成一个 token）</h2>
+  <div class="grid">
+    <div><label>KV 头数 K（GQA 分组数）：<b id="vK"></b></label><input id="K" type="range" min="0" max="6" value="6"></div>
+    <div><label>KV cache 精度</label><select id="kvb"><option value="2">bf16（2 字节）</option><option value="1">fp8/int8（1 字节）</option></select></div>
+    <div><label>GPU</label><select id="gpu"><option value="h100">H100 80GB · 3.35 TB/s · 989 TFLOP/s</option><option value="b200">B200 192GB · 8 TB/s · 2250 TFLOP/s（约）</option></select></div>
+  </div>
+  <div class="card">
+    <div class="muted">显存占用（蓝 = 参数，紫 = KV cache；竖线 = 显存上限）</div>
+    <div class="membar" id="membar"></div>
+    <table id="tbl" style="margin-top:8px"></table>
+  </div>
+  <div class="card">
+    <div class="muted">batch 大小 B 的权衡：每 token 延迟（橙）与吞吐（绿）。灰色区域 = 显存放不下。圆点 = 当前 B。</div>
+    <svg id="chart" viewBox="0 0 700 240"></svg>
+  </div>
+  <div class="card muted">公式（与讲义一致，只计矩阵乘法、bf16 参数）：参数量 = 2VD + 3DFL + (2DNH + 2DKH)L；每 token 的 KV = 2(K 和 V) × K × H × L × 字节数；
+    Decode 阶段受显存带宽限制：每步要把“全部参数 + 全部 KV cache”从 HBM 读一遍，所以 延迟 ≈ (参数字节 + B × S × 每 token KV) ÷ 带宽，吞吐 = B ÷ 延迟。
+    动画里每个阶段的耗时取 max(FLOPs ÷ 算力, 字节 ÷ 带宽)。</div>
+</div>
+<script>
+(function(){
+  var MODELS=[
+    {n:"Llama 2 13B（MHA，讲义示例）",D:5120,F:13824,N:40,K:40,H:128,L:40,V:32000},
+    {n:"Llama 2 7B（MHA）",D:4096,F:11008,N:32,K:32,H:128,L:32,V:32000},
+    {n:"Llama 3 8B（GQA，K=8）",D:4096,F:14336,N:32,K:8,H:128,L:32,V:128256},
+    {n:"Llama 3 70B（GQA，K=8）",D:8192,F:28672,N:64,K:8,H:128,L:80,V:128256}];
+  var GPUS={h100:{mem:80e9,bw:3.35e12,fl:989e12},b200:{mem:192e9,bw:8e12,fl:2250e12}};
+  function $(id){return document.getElementById(id);}
+  MODELS.forEach(function(m,i){var o=document.createElement("option");o.value=i;o.textContent=m.n;$("model").appendChild(o);});
+  var KOPTS=[1,2,4,8,16,32,40,64];
+
+  function cfg(){
+    var m=MODELS[+$("model").value];
+    var Kmax=m.N, kv=+$("kvb").value;
+    var opts=KOPTS.filter(function(k){return k<=Kmax && m.N%k===0;});
+    var ki=Math.min(+$("K").value, opts.length-1);
+    $("K").max=opts.length-1;
+    return {m:m,B:Math.pow(2,+$("B").value),S:Math.pow(2,+$("S").value),K:opts[ki],kvb:kv,g:GPUS[$("gpu").value]};
+  }
+  function params(m,K){ return 2*m.V*m.D + 3*m.D*m.F*m.L + (2*m.D*m.N*m.H + 2*m.D*K*m.H)*m.L; }
+  function kvTok(m,K,kvb){ return 2*K*m.H*m.L*kvb; }
+  function fmtB(b){ return b>=1e9?(b/1e9).toFixed(b>=1e11?0:1)+" GB": b>=1e6?(b/1e6).toFixed(1)+" MB":(b/1e3).toFixed(0)+" KB"; }
+  function fmtT(s){ return s>=1?s.toFixed(2)+" s": s>=1e-3?(s*1e3).toFixed(s<0.01?2:1)+" ms":(s*1e6).toFixed(0)+" µs"; }
+  function fmtN(x){ return x>=1e15?(x/1e15).toFixed(1)+"P": x>=1e12?(x/1e12).toFixed(1)+"T": x>=1e9?(x/1e9).toFixed(1)+"G":(x/1e6).toFixed(1)+"M"; }
+
+  // ---------- 动画 ----------
+  var PROMPT=["Never","gonna","give","you"], GEN=["up",",","never","gonna","let","you","down","."];
+  var LAYERS=4, step=0, maxStep=1+GEN.length, playing=false, timer=null;
+  var svg=$("anim"), NS="http://www.w3.org/2000/svg";
+  function el(t,a,p){var e=document.createElementNS(NS,t);for(var k in a)e.setAttribute(k,a[k]);(p||svg).appendChild(e);return e;}
+  var X0=92, CW=48, nCols=PROMPT.length+GEN.length;
+  function colX(i){ return X0+i*((700-X0-8)/nCols); }
+  function draw(highlight){
+    while(svg.firstChild) svg.removeChild(svg.firstChild);
+    var cw=(700-X0-8)/nCols;
+    var genCount = Math.max(0, step-1);
+    var tokCount = step===0?PROMPT.length: PROMPT.length+genCount;
+    // 行标签
+    var t1=el("text",{x:8,y:34,"font-size":"12",fill:"var(--muted)"}); t1.textContent="token";
+    for(var l=0;l<LAYERS;l++){ var t=el("text",{x:8,y:78+l*48,"font-size":"12",fill:"var(--muted)"}); t.textContent="第 "+(l+1)+" 层 K/V"; }
+    var tl=el("text",{x:8,y:282,"font-size":"11",fill:"var(--muted)"}); tl.textContent="（示意：真实模型有 L 层、每层 K 个头）";
+    for(var i=0;i<nCols;i++){
+      var x=colX(i), isPrompt=i<PROMPT.length, word=isPrompt?PROMPT[i]:GEN[i-PROMPT.length];
+      var shown = i<tokCount;
+      var isNew = highlight && ((highlight==="prefill" && isPrompt) || (highlight==="decode" && i===tokCount-1));
+      // token 方块
+      el("rect",{x:x+2,y:14,width:cw-4,height:28,rx:5,fill: shown?(isPrompt?"var(--w)":"var(--good)"):"none",stroke:"var(--line)","stroke-dasharray":shown?"":"3 3"});
+      if(shown){ var tt=el("text",{x:x+cw/2,y:32,"text-anchor":"middle","font-size":word.length>5?"9.5":"11",fill:"#fff","font-weight":"600"}); tt.textContent=word; }
+      // KV 格子
+      var cacheFilled = (step>=1 && isPrompt) || (!isPrompt && i<tokCount);
+      for(var l2=0;l2<LAYERS;l2++){
+        var y=58+l2*48;
+        var read = highlight==="decode" && cacheFilled && !isNew;
+        var fillK = cacheFilled ? (isNew?"var(--new)":"var(--k)") : "var(--track)";
+        var fillV = cacheFilled ? (isNew?"var(--new)":"var(--v)") : "var(--track)";
+        if(read){ el("rect",{x:x+1,y:y-3,width:cw-2,height:42,rx:4,fill:"var(--read)"}); }
+        el("rect",{x:x+5,y:y,width:cw-10,height:17,rx:3,fill:fillK});
+        el("rect",{x:x+5,y:y+19,width:cw-10,height:17,rx:3,fill:fillV});
+        if(l2===0 && cacheFilled && cw>30){ var a=el("text",{x:x+cw/2,y:y+12,"text-anchor":"middle","font-size":"9",fill:"#fff"}); a.textContent="K"; var b=el("text",{x:x+cw/2,y:y+31,"text-anchor":"middle","font-size":"9",fill:"#fff"}); b.textContent="V"; }
+      }
+    }
+    // 分隔线
+    var sx=colX(PROMPT.length)-1; el("line",{x1:sx,y1:8,x2:sx,y2:252,stroke:"var(--muted)","stroke-dasharray":"4 3"});
+    var p1=el("text",{x:(X0+sx)/2,y:266,"text-anchor":"middle","font-size":"11",fill:"var(--muted)"}); p1.textContent="提示词（prefill）";
+    var p2=el("text",{x:(sx+692)/2,y:266,"text-anchor":"middle","font-size":"11",fill:"var(--muted)"}); p2.textContent="生成的回答（decode）";
+  }
+  function stepInfo(){
+    var c=cfg(), m=c.m, P=params(m,c.K), kvt=kvTok(m,c.K,c.kvb), B=c.B, S=c.S, g=c.g;
+    var html="", stats="";
+    if(step===0){
+      html="还没开始。用户发来一段提示词（真实长度 S = "+S+" 个 token，这里画成 4 格）。KV cache 是空的。点“单步”开始 prefill。";
+      $("phase").innerHTML="";
+    } else if(step===1){
+      var fl=2*P*B*S + 2*B*S*S*m.N*m.H*m.L;          // 线性层 + 因果注意力（约一半）
+      var by=2*P + B*S*kvt;                           // 读一遍参数 + 写入 KV cache
+      var tc=fl/g.fl, tm=by/g.bw, t=Math.max(tc,tm);
+      html="<b>Prefill</b>：提示词的 "+S+" 个 token <b>一次性并行</b>送进 Transformer（和训练时一样是大矩阵乘法），每层算出所有位置的 K、V 写进 cache（橙色），同时得到第一个输出 token 的分布。"+
+        "参数读一遍就被 B×S = "+(B*S).toLocaleString()+" 个 token 复用，算术强度高 → <b>受算力限制</b>。这一步的耗时基本就是 <b>首 token 延迟 TTFT</b>。";
+      $("phase").innerHTML="<span class='tag' style='background:var(--accent)'>Prefill</span>";
+      stats=st("本步 FLOPs",fmtN(fl))+st("本步搬运字节",fmtB(by))+st("算术强度 FLOPs/字节",(fl/by).toFixed(0)+"（H100 ≈ 295）")+st("瓶颈 / 耗时",(tc>tm?"算力":"带宽")+" · "+fmtT(t));
+    } else {
+      var ctx=S+step-1;
+      var fl2=2*P*B + 4*B*ctx*m.N*m.H*m.L;
+      var by2=2*P + B*ctx*kvt;
+      var tc2=fl2/g.fl, tm2=by2/g.bw, t2=Math.max(tc2,tm2);
+      html="<b>Decode 第 "+(step-1)+" 步</b>：只把<b>上一步刚生成的 1 个 token</b> 送进模型。它的 Q 要和 cache 里<b>所有</b>历史 K、V 做注意力（黄色 = 被读取），算出新 K、V 追加到 cache 末尾（橙色）。"+
+        "每步都要把全部参数和全部 KV cache 从显存读一遍，却只算出 B = "+B+" 个 token → 算术强度很低，<b>受显存带宽限制</b>。KV cache 每步增长 B × "+fmtB(kvt)+"。";
+      $("phase").innerHTML="<span class='tag' style='background:var(--good)'>Decode</span> 上下文长度 "+ctx;
+      stats=st("本步 FLOPs",fmtN(fl2))+st("本步读取字节",fmtB(by2))+st("算术强度 FLOPs/字节",(fl2/by2).toFixed(1))+st("瓶颈 / 每 token 耗时",(tc2>tm2?"算力":"带宽")+" · "+fmtT(t2));
+    }
+    $("explain").innerHTML=html; $("stepStats").innerHTML=stats;
+    $("bStep").disabled = step>=maxStep;
+  }
+  function st(a,b){return "<div class='stat'>"+a+"<b>"+b+"</b></div>";}
+  function render(){ draw(step===0?null:(step===1?"prefill":"decode")); stepInfo(); }
+  function stop(){ playing=false; if(timer){clearTimeout(timer);timer=null;} $("bPlay").textContent="▶ 自动播放"; }
+  $("bReset").onclick=function(){ stop(); step=0; render(); };
+  $("bStep").onclick=function(){ stop(); if(step<maxStep){step++; render();} };
+  $("bPlay").onclick=function(){ if(playing){stop();return;} if(step>=maxStep) step=0; playing=true; $("bPlay").textContent="⏸ 暂停";
+    (function loop(){ if(!playing) return; if(step>=maxStep){stop();return;} step++; render(); timer=setTimeout(loop, step===1?2200:1200); })(); };
+
+  // ---------- 计算器 ----------
+  function calc(){
+    var c=cfg(), m=c.m, P=params(m,c.K), kvt=kvTok(m,c.K,c.kvb), g=c.g;
+    $("vB").textContent=c.B; $("vS").textContent=c.S; $("vK").textContent=c.K+(c.K===m.N?"（= N，即 MHA）":c.K===1?"（MQA）":"（GQA，压缩 "+(m.N/c.K)+" 倍）");
+    var pB=2*P, kvSeq=c.S*kvt, kvAll=c.B*kvSeq, mem=pB+kvAll;
+    var lat=mem/g.bw, thr=c.B/lat;
+    var bar=$("membar"), scale=Math.max(g.mem, mem)*1.05;
+    bar.innerHTML="<div style='left:0;width:"+(pB/scale*100)+"%;background:var(--k)'></div><div style='left:"+(pB/scale*100)+"%;width:"+(kvAll/scale*100)+"%;background:var(--kv)'></div><div class='lim' style='left:"+(g.mem/scale*100)+"%'></div>";
+    var fits=mem<=g.mem;
+    $("tbl").innerHTML=
+      row("参数量",(P/1e9).toFixed(2)+" B → bf16 "+fmtB(pB))+
+      row("每个 token 的 KV cache",fmtB(kvt)+" = 2 × "+c.K+" × "+m.H+" × "+m.L+" × "+c.kvb+" 字节")+
+      row("每条序列（S = "+c.S+"）的 KV cache",fmtB(kvSeq))+
+      row("B = "+c.B+" 条序列的 KV cache",fmtB(kvAll))+
+      row("总显存（参数 + KV）","<span class='"+(fits?"ok":"no")+"'>"+fmtB(mem)+(fits?" ✓ 放得下":" ✗ 放不下")+"</span>")+
+      row("每 token 延迟（≈ 总显存 ÷ 带宽）",fmtT(lat))+
+      row("吞吐（B ÷ 延迟）",Math.round(thr).toLocaleString()+" token/s");
+    chart(c,m,P,kvt,g);
+    render();
+  }
+  function row(a,b){return "<tr><td>"+a+"</td><td>"+b+"</td></tr>";}
+  function chart(c,m,P,kvt,g){
+    var cs=$("chart"); while(cs.firstChild) cs.removeChild(cs.firstChild);
+    function e(t,a){var x=document.createElementNS(NS,t);for(var k in a)x.setAttribute(k,a[k]);cs.appendChild(x);return x;}
+    var L=50,R=650,T=14,Bm=200, Bs=[], i;
+    for(i=0;i<=9;i++) Bs.push(Math.pow(2,i));
+    var pts=Bs.map(function(B){ var mem=2*P+B*c.S*kvt; var lat=mem/g.bw; return {B:B,lat:lat,thr:B/lat,fit:mem<=g.mem}; });
+    var maxLat=Math.max.apply(null,pts.map(function(p){return p.lat;})), maxThr=Math.max.apply(null,pts.map(function(p){return p.thr;}));
+    function X(i){return L+i*(R-L)/9;}
+    // 放不下的区域
+    var firstBad=-1; for(i=0;i<pts.length;i++) if(!pts[i].fit){firstBad=i;break;}
+    if(firstBad>=0) e("rect",{x:X(Math.max(0,firstBad-0.5)),y:T,width:R-X(Math.max(0,firstBad-0.5))+10,height:Bm-T,fill:"var(--track)"});
+    e("line",{x1:L,y1:Bm,x2:R+10,y2:Bm,stroke:"var(--muted)"});
+    Bs.forEach(function(B,i){ var t=e("text",{x:X(i),y:Bm+16,"text-anchor":"middle","font-size":"11",fill:"var(--muted)"}); t.textContent=B; });
+    var xl=e("text",{x:(L+R)/2,y:Bm+32,"text-anchor":"middle","font-size":"11",fill:"var(--muted)"}); xl.textContent="并发请求数 B";
+    function line(key,max,color){ var d=""; pts.forEach(function(p,i){ d+=(i?"L":"M")+X(i)+","+(Bm-(p[key]/max)*(Bm-T-6)); }); e("path",{d:d,fill:"none",stroke:color,"stroke-width":"2.5"}); }
+    line("lat",maxLat,"var(--new)"); line("thr",maxThr,"var(--good)");
+    var ci=Math.round(Math.log2(c.B));
+    var p=pts[ci];
+    e("circle",{cx:X(ci),cy:Bm-(p.lat/maxLat)*(Bm-T-6),r:5,fill:"var(--new)"});
+    e("circle",{cx:X(ci),cy:Bm-(p.thr/maxThr)*(Bm-T-6),r:5,fill:"var(--good)"});
+    var lg=e("text",{x:L+6,y:T+10,"font-size":"11",fill:"var(--fg)"}); lg.textContent="延迟 最高 "+fmtT(maxLat)+" ｜ 吞吐 最高 "+Math.round(maxThr).toLocaleString()+" tok/s";
+  }
+  ["model","B","S","K","kvb","gpu"].forEach(function(id){$(id).addEventListener("input",calc);$(id).addEventListener("change",function(){ if(id==="model"){ var m=MODELS[+$("model").value]; var opts=KOPTS.filter(function(k){return k<=m.N && m.N%k===0;}); $("K").max=opts.length-1; $("K").value=opts.indexOf(m.K);} calc(); });});
+  // 初始化 K 滑块为模型默认值
+  (function(){ var m=MODELS[0]; var opts=KOPTS.filter(function(k){return k<=m.N && m.N%k===0;}); $("K").max=opts.length-1; $("K").value=opts.indexOf(m.K); })();
+  calc();
+})();
+</script>
+</body>
+</html>

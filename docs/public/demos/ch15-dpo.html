@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DPO 偏好优化</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#656d76;--card:#f6f8fa;--border:#d0d7de;--accent:#2563eb;--good:#16a34a;--bad:#dc2626;--ref:#9ca3af;--warn:#d97706}
+@media (prefers-color-scheme: dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8b949e;--card:#161b22;--border:#30363d;--accent:#58a6ff;--good:#4ade80;--bad:#f87171;--ref:#6b7280;--warn:#f59e0b}}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+h3{margin:0 0 6px;font-size:16px}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:8px}
+select,button{font:inherit;padding:4px 10px;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--fg);cursor:pointer}
+button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+input[type=range]{width:110px;vertical-align:middle}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px}
+.resp{display:grid;grid-template-columns:minmax(90px,150px) 1fr 70px;gap:6px;align-items:center;margin:6px 0;font-size:13px}
+.track{position:relative;height:22px;background:var(--bg);border:1px solid var(--border);border-radius:4px;overflow:hidden}
+.refbar{position:absolute;top:0;left:0;height:6px;background:var(--ref)}
+.pibar{position:absolute;bottom:0;left:0;height:16px;background:var(--accent);transition:width .25s}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.pairs{display:flex;flex-wrap:wrap;gap:6px}
+.pair{font-size:12px;padding:3px 6px;border-radius:5px;border:1px solid var(--border);background:var(--bg)}
+.pair .w{color:var(--good);font-weight:600}.pair .l{color:var(--bad);font-weight:600}
+.pair .g{display:inline-block;height:6px;background:var(--warn);border-radius:3px;vertical-align:middle;margin-left:4px}
+canvas{width:100%;height:120px;display:block}
+.note{font-size:12px;color:var(--muted)}
+.legend span{margin-right:12px;font-size:12px;color:var(--muted)}
+.sw{display:inline-block;width:12px;height:8px;vertical-align:middle;margin-right:3px}
+</style>
+</head>
+<body>
+<h3>DPO：推高赢家、压低输家，步长看「错得多离谱」</h3>
+<div class="note">提示：「解释什么是递归」。模型只可能输出下面 4 种回答（把真实的 LLM 简化成 4 选 1 的分布），标注员给出了若干偏好对。</div>
+<div class="row" style="margin-top:6px">
+  <label>方法：<select id="method"><option value="dpo">DPO</option><option value="sft">只对赢家做 SFT</option></select></label>
+  <label>β = <input type="range" id="beta" min="0.05" max="1" step="0.05" value="0.1"><b id="betaV">0.10</b></label>
+  <label>学习率 <input type="range" id="lr" min="0.5" max="20" step="0.5" value="5"><b id="lrV">5</b></label>
+</div>
+<div class="row">
+  <button class="primary" id="step">训练 1 步</button>
+  <button id="play">▶ 自动播放</button>
+  <button id="reset">重置</button>
+  <span class="note">步数：<b id="stepN">0</b></span>
+</div>
+<div class="card">
+  <div class="legend"><span><i class="sw" style="background:var(--ref)"></i>参考模型 π_ref（冻结）</span><span><i class="sw" style="background:var(--accent)"></i>当前模型 π_θ</span><span>右侧数字：隐含奖励 r̂ = β·log(π_θ/π_ref)</span></div>
+  <div id="resps"></div>
+</div>
+<div class="card">
+  <div style="font-size:13px;margin-bottom:4px">偏好对（<span style="color:var(--good)">赢家</span> ≻ <span style="color:var(--bad)">输家</span>），橙色条 = 本步梯度权重 σ(r̂_l − r̂_w)：</div>
+  <div class="pairs" id="pairs"></div>
+</div>
+<div class="card">
+  <div style="font-size:13px">平均损失曲线（<span id="lossName">DPO 损失</span>）：<b id="lossV"></b></div>
+  <canvas id="cv" width="640" height="120"></canvas>
+</div>
+<div class="note" id="explain"></div>
+<script>
+(function(){
+var R=[{n:'A 详细且正确',ref:0.25},{n:'B 简短正确',ref:0.30},{n:'C 啰嗦且有错',ref:0.25},{n:'D 拒绝回答',ref:0.20}];
+var P=[[0,2],[0,3],[1,2],[1,3],[0,1]];
+var th,step,hist,timer=null;
+function logref(i){return Math.log(R[i].ref);}
+function reset(){th=R.map(function(r){return Math.log(r.ref);});step=0;hist=[];stop();render();}
+function probs(){var m=Math.max.apply(null,th),e=th.map(function(t){return Math.exp(t-m);}),s=e.reduce(function(a,b){return a+b;},0);return e.map(function(x){return x/s;});}
+function sig(z){return 1/(1+Math.exp(-z));}
+function beta(){return +document.getElementById('beta').value;}
+function method(){return document.getElementById('method').value;}
+function stats(){
+  var p=probs(),b=beta(),rh=p.map(function(pi,i){return b*(Math.log(pi)-logref(i));});
+  var loss=0,ws=[];
+  P.forEach(function(pr){
+    var w=pr[0],l=pr[1];
+    if(method()==='dpo'){var z=rh[w]-rh[l];loss+=-Math.log(sig(z));ws.push(sig(-z));}
+    else{loss+=-Math.log(p[w]);ws.push(1);}
+  });
+  return {p:p,rh:rh,loss:loss/P.length,ws:ws};
+}
+function doStep(){
+  var s=stats(),b=beta(),lr=+document.getElementById('lr').value,g=[0,0,0,0];
+  P.forEach(function(pr,k){
+    var w=pr[0],l=pr[1];
+    if(method()==='dpo'){
+      // dL/dθ = -β σ(r̂_l - r̂_w) (e_w - e_l)  （softmax 中 logsumexp 项相减抵消）
+      var c=b*s.ws[k];g[w]-=c;g[l]+=c;
+    }else{
+      // SFT: dL/dθ = -(e_w - π)
+      for(var i=0;i<4;i++)g[i]-=((i===w?1:0)-s.p[i]);
+    }
+  });
+  for(var i=0;i<4;i++)th[i]-=lr*g[i]/P.length;
+  hist.push(s.loss);step++;render();
+}
+function render(){
+  var s=stats();
+  var box=document.getElementById('resps');box.innerHTML='';
+  R.forEach(function(r,i){
+    var d=document.createElement('div');d.className='resp';
+    d.innerHTML='<div>'+r.n+'</div><div class="track"><div class="refbar" style="width:'+(r.ref*100)+'%"></div><div class="pibar" style="width:'+(s.p[i]*100)+'%"></div></div><div class="num">'+(s.p[i]*100).toFixed(1)+'%<br><span style="color:'+(s.rh[i]>=0?'var(--good)':'var(--bad)')+'">'+(s.rh[i]>=0?'+':'')+s.rh[i].toFixed(2)+'</span></div>';
+    box.appendChild(d);
+  });
+  var pb=document.getElementById('pairs');pb.innerHTML='';
+  P.forEach(function(pr,k){
+    var d=document.createElement('span');d.className='pair';
+    d.innerHTML='<span class="w">'+R[pr[0]].n[0]+'</span> ≻ <span class="l">'+R[pr[1]].n[0]+'</span>'+(method()==='dpo'?' <i class="g" style="width:'+(s.ws[k]*50)+'px"></i> '+s.ws[k].toFixed(2):'');
+    pb.appendChild(d);
+  });
+  document.getElementById('stepN').textContent=step;
+  document.getElementById('betaV').textContent=beta().toFixed(2);
+  document.getElementById('lrV').textContent=document.getElementById('lr').value;
+  document.getElementById('lossV').textContent=s.loss.toFixed(4);
+  document.getElementById('lossName').textContent=method()==='dpo'?'DPO 损失':'赢家的负对数似然';
+  document.getElementById('explain').innerHTML=method()==='dpo'?
+   '观察：一开始所有偏好对的权重都是 0.50（σ(0)）。模型越是“判对”某一对，它的橙色条越短，该对对更新的贡献越小。C、D 只当输家，概率被持续压低；A 既赢 B 又赢 C/D，被推得最高。增大 β 时，同样的概率变化对应更大的隐含奖励，损失下降更快、偏离参考模型的“动力”更小——β 越大越保守。':
+   '对比：只对赢家做 SFT 时，B 也是赢家（赢了 C 和 D），所以它和 A 一起被推高；“A ≻ B”这条信息几乎用不上，而且没有“负梯度”去主动压低差回答，C、D 只是被动地被挤掉。';
+  drawLoss();
+}
+function drawLoss(){
+  var cv=document.getElementById('cv'),ctx=cv.getContext('2d'),W=cv.width,H=cv.height;
+  ctx.clearRect(0,0,W,H);
+  var cs=getComputedStyle(document.body);
+  ctx.strokeStyle=cs.getPropertyValue('--border');ctx.beginPath();ctx.moveTo(30,5);ctx.lineTo(30,H-15);ctx.lineTo(W-5,H-15);ctx.stroke();
+  if(hist.length<1)return;
+  var mx=Math.max.apply(null,hist)*1.05||1,n=Math.max(hist.length,20);
+  ctx.strokeStyle=cs.getPropertyValue('--accent');ctx.lineWidth=2;ctx.beginPath();
+  hist.forEach(function(v,i){var x=30+(W-40)*i/(n-1),y=(H-15)-(H-25)*v/mx;if(i)ctx.lineTo(x,y);else ctx.moveTo(x,y);});
+  ctx.stroke();ctx.lineWidth=1;
+  ctx.fillStyle=cs.getPropertyValue('--muted');ctx.font='11px sans-serif';ctx.fillText(mx.toFixed(2),2,14);ctx.fillText('0',18,H-15);
+}
+function stop(){if(timer){clearInterval(timer);timer=null;document.getElementById('play').textContent='▶ 自动播放';}}
+document.getElementById('step').onclick=function(){stop();doStep();};
+document.getElementById('play').onclick=function(){if(timer){stop();return;}this.textContent='⏸ 暂停';timer=setInterval(function(){doStep();if(step>=200)stop();},120);};
+document.getElementById('reset').onclick=reset;
+document.getElementById('method').onchange=reset;
+document.getElementById('beta').oninput=function(){render();};
+document.getElementById('lr').oninput=function(){render();};
+reset();
+})();
+</script>
+</body>
+</html>

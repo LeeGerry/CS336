@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CLIP 与 SigLIP</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#656d76;--card:#f6f8fa;--border:#d0d7de;--accent:#2563eb;--good:#16a34a;--bad:#dc2626;--warn:#d97706;--off:#e5e7eb}
+@media (prefers-color-scheme: dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8b949e;--card:#161b22;--border:#30363d;--accent:#58a6ff;--good:#4ade80;--bad:#f87171;--warn:#f59e0b;--off:#21262d}}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+h3{margin:0 0 6px;font-size:16px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px;font-size:13px}
+select,button{font:inherit;padding:4px 10px;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--fg);cursor:pointer}
+button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+input[type=range]{width:90px;vertical-align:middle}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px}
+table{border-collapse:separate;border-spacing:2px;width:100%;table-layout:fixed}
+th{font-size:11px;font-weight:normal;color:var(--muted);padding:2px;word-break:break-all;line-height:1.25}
+th.img{font-size:22px;width:38px}
+td{text-align:center;font-size:12px;height:40px;border-radius:4px;font-variant-numeric:tabular-nums;border:2px solid transparent}
+td.diag{box-shadow:inset 0 0 0 2px var(--good)}
+td.arg{border-color:var(--warn)}
+canvas{width:100%;height:100px;display:block}
+.note{font-size:12px;color:var(--muted)}
+.stat b{font-size:16px}
+</style>
+</head>
+<body>
+<h3>对比学习：让配对的图文在相似度矩阵的对角线上「亮起来」</h3>
+<div class="row">
+  <label>损失 <select id="loss"><option value="clip">CLIP：按行、按列做 softmax 多分类</option><option value="siglip">SigLIP：每格独立 sigmoid 二分类</option></select></label>
+  <label>批大小 N <input type="range" id="N" min="2" max="6" value="5"><b id="Nv">5</b></label>
+  <label>显示 <select id="show"><option value="sim">余弦相似度</option><option value="prob">模型给出的「配对」概率</option></select></label>
+</div>
+<div class="row">
+  <button class="primary" id="step">训练 1 步</button><button id="auto">▶ 自动训练</button><button id="reset">重新随机初始化</button>
+  <span class="note">步数 <b id="it">0</b></span>
+</div>
+<div class="card">
+  <table id="mat"></table>
+  <div class="note" style="margin-top:4px">行 = 图片编码 I<sub>i</sub>，列 = 文字编码 T<sub>j</sub>。绿框 = 正确配对（对角线）；橙边 = 该图片在零样本分类时会选的文字（行内最大值）。</div>
+</div>
+<div class="card">
+  <div class="row" style="margin:0">
+    <span class="stat">损失 <b id="lv"></b></span>
+    <span class="stat">零样本「图→文」准确率 <b id="acc"></b></span>
+    <span class="stat" id="extra"></span>
+  </div>
+  <canvas id="cv" width="640" height="100"></canvas>
+</div>
+<div class="note" id="explain"></div>
+<script>
+(function(){
+function $(i){return document.getElementById(i);}
+var ITEMS=[['🐶','草地上奔跑的小狗'],['🐱','沙发上睡觉的猫'],['🚗','停在路边的红色汽车'],['🍎','桌上的一个苹果'],['✈️','蓝天中的飞机'],['🐺','雪地里的一只狼']];
+var D=4,TEMP=8,img,txt,bias,it,hist,timer=null,seed=7;
+function rnd(){seed=(seed*16807)%2147483647;return seed/2147483647-0.5;}
+function N(){return +$('N').value;}
+function init(){img=[];txt=[];for(var i=0;i<6;i++){var a=[],b=[];for(var d=0;d<D;d++){a.push(rnd());b.push(rnd());}img.push(a);txt.push(b);}bias=-2;it=0;hist=[];}
+function norm(v){var s=Math.sqrt(v.reduce(function(a,x){return a+x*x;},0))||1;return v.map(function(x){return x/s;});}
+function sims(I,T){var n=N(),S=[];for(var i=0;i<n;i++){var a=norm(I[i]),r=[];for(var j=0;j<n;j++){var b=norm(T[j]),s=0;for(var d=0;d<D;d++)s+=a[d]*b[d];r.push(s);}S.push(r);}return S;}
+function lse(a){var m=Math.max.apply(null,a);return m+Math.log(a.reduce(function(s,x){return s+Math.exp(x-m);},0));}
+function lossOf(I,T,b){
+  var S=sims(I,T),n=N(),L=0;
+  if($('loss').value==='clip'){
+    for(var i=0;i<n;i++){var row=S[i].map(function(x){return TEMP*x;});L+=lse(row)-row[i];}
+    for(var j=0;j<n;j++){var col=[];for(var k=0;k<n;k++)col.push(TEMP*S[k][j]);L+=lse(col)-col[j];}
+    return L/(2*n);
+  }
+  for(var i2=0;i2<n;i2++)for(var j2=0;j2<n;j2++){var z=(i2===j2?1:-1)*(TEMP*S[i2][j2]+b);L+=Math.log(1+Math.exp(-z));}
+  return L/n;
+}
+function step(){
+  var lr=0.15,h=1e-4,base=lossOf(img,txt,bias),gI=[],gT=[];
+  for(var i=0;i<N();i++){gI.push([]);gT.push([]);for(var d=0;d<D;d++){
+    img[i][d]+=h;gI[i].push((lossOf(img,txt,bias)-base)/h);img[i][d]-=h;
+    txt[i][d]+=h;gT[i].push((lossOf(img,txt,bias)-base)/h);txt[i][d]-=h;}}
+  var gb=0;if($('loss').value==='siglip'){gb=(lossOf(img,txt,bias+h)-base)/h;}
+  for(var i3=0;i3<N();i3++)for(var d3=0;d3<D;d3++){img[i3][d3]-=lr*gI[i3][d3];txt[i3][d3]-=lr*gT[i3][d3];}
+  bias-=lr*gb;it++;hist.push(base);
+}
+function color(v,lo,hi){var t=Math.max(0,Math.min(1,(v-lo)/(hi-lo)));var r=Math.round(37+(220-37)*(1-t)),g=Math.round(99+(38-99)*(1-t)*0.3+60*t),bl=Math.round(235*t+38*(1-t));return 'rgba('+Math.round(220*(1-t)+37*t)+','+Math.round(60*(1-t)+99*t)+','+Math.round(60*(1-t)+235*t)+','+(0.25+0.65*Math.abs(t-0.5)*2)+')';}
+function render(){
+  var n=N(),S=sims(img,txt),show=$('show').value,cl=$('loss').value==='clip';
+  var h='<tr><th class="img"></th>';for(var j=0;j<n;j++)h+='<th>'+ITEMS[j][1]+'</th>';h+='</tr>';
+  var correct=0;
+  for(var i=0;i<n;i++){
+    var row=S[i],am=0;for(var k=1;k<n;k++)if(row[k]>row[am])am=k;if(am===i)correct++;
+    var pr;if(cl){var l=lse(row.map(function(x){return TEMP*x;}));pr=row.map(function(x){return Math.exp(TEMP*x-l);});}else pr=row.map(function(x){return 1/(1+Math.exp(-(TEMP*x+bias)));});
+    h+='<tr><th class="img">'+ITEMS[i][0]+'</th>';
+    for(var j2=0;j2<n;j2++){var v=show==='sim'?row[j2]:pr[j2];var bg=show==='sim'?color(row[j2],-1,1):color(pr[j2],0,1);
+      h+='<td class="'+(i===j2?'diag ':'')+(j2===am?'arg':'')+'" style="background:'+bg+'">'+(show==='sim'?v.toFixed(2):(v*100).toFixed(0)+'%')+'</td>';}
+    h+='</tr>';
+  }
+  $('mat').innerHTML=h;
+  var L=lossOf(img,txt,bias);$('lv').textContent=L.toFixed(3);$('acc').textContent=correct+' / '+n;$('it').textContent=it;$('Nv').textContent=n;
+  $('extra').innerHTML=cl?'均匀猜测时损失 = ln N = <b>'+Math.log(n).toFixed(3)+'</b>':'偏置 b = <b>'+bias.toFixed(2)+'</b>';
+  $('explain').innerHTML=cl?'CLIP：每一行是「这张图在 N 段文字中选哪段」的 softmax（每行概率加起来 = 100%），每一列同理。所以一格的概率取决于整行整列——损失和批大小 N 绑在一起：N 变了，问题就变了（随机猜的损失 ln N 也跟着变）。训练时必须拿到整个批次的相似度才能归一化。':'SigLIP：每一格独立地问「这对图文配不配？」（概率互不相加为 1）。对角线要接近 100%，其余要接近 0%。因为负样本（'+(n*n-n)+' 格）远多于正样本（'+n+' 格），可学习的偏置 b 会是负数，让模型默认「不配对」。每格独立 → 可以把矩阵分块在不同设备上算，再把损失加起来。';
+  var cv=$('cv'),ctx=cv.getContext('2d'),W=cv.width,H=cv.height,cs=getComputedStyle(document.body);ctx.clearRect(0,0,W,H);
+  ctx.strokeStyle=cs.getPropertyValue('--border');ctx.beginPath();ctx.moveTo(30,4);ctx.lineTo(30,H-12);ctx.lineTo(W-4,H-12);ctx.stroke();
+  if(hist.length>1){var mx=Math.max.apply(null,hist),nn=Math.max(hist.length,60);ctx.strokeStyle=cs.getPropertyValue('--accent');ctx.lineWidth=2;ctx.beginPath();
+    hist.forEach(function(v,k){var x=30+(W-36)*k/(nn-1),y=(H-12)-(H-18)*v/mx;if(k)ctx.lineTo(x,y);else ctx.moveTo(x,y);});ctx.stroke();ctx.lineWidth=1;
+    ctx.fillStyle=cs.getPropertyValue('--muted');ctx.font='11px sans-serif';ctx.fillText(mx.toFixed(2),0,12);ctx.fillText('0',18,H-12);}
+}
+function stop(){if(timer){clearInterval(timer);timer=null;$('auto').textContent='▶ 自动训练';}}
+$('step').onclick=function(){stop();step();render();};
+$('auto').onclick=function(){if(timer){stop();return;}this.textContent='⏸ 暂停';timer=setInterval(function(){for(var k=0;k<3;k++)step();render();if(it>=300)stop();},60);};
+$('reset').onclick=function(){stop();seed=Math.floor(Math.random()*100000)+1;init();render();};
+$('loss').onchange=function(){stop();hist=[];it=0;render();};
+$('N').oninput=function(){stop();hist=[];it=0;render();};
+$('show').onchange=render;
+init();render();
+})();
+</script>
+</body>
+</html>

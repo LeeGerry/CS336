@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>循环模型的稳定性</title>
+<style>
+:root{
+  --bg:#ffffff; --fg:#1f2328; --muted:#656d76; --card:#f6f8fa; --border:#d0d7de; --grid:#e6e9ed;
+  --u:#d1495b; --i:#c77d00; --p:#2e7d32; --accent:#3b6fd8;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#16181d; --fg:#e6e8eb; --muted:#9aa4b2; --card:#20242b; --border:#363c46; --grid:#2a2f37;
+    --u:#ff7a85; --i:#ffb84d; --p:#6fd17a; --accent:#7aa2ff;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+h1{font-size:16px;margin:0 0 8px}
+.ctl{display:grid;grid-template-columns:auto 1fr auto;gap:4px 8px;align-items:center}
+.ctl input{width:100%}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-top:8px}
+canvas{width:100%;display:block;border-radius:8px;background:var(--card);border:1px solid var(--border);margin-top:8px}
+.small{font-size:12px;color:var(--muted)}
+.k{display:inline-block;width:12px;height:3px;vertical-align:middle;margin:0 4px 0 10px}
+label.cb{display:flex;gap:6px;align-items:center;margin-top:6px}
+</style>
+</head>
+<body>
+<h1>把同一个块循环 T 次：残差状态会不会爆炸？</h1>
+<div class="card small">线性化后的残差递推（忽略非线性部分 R）：<b>h<sub>t+1</sub> = A·h<sub>t</sub> + B·e</b>。e 是进入循环前的输入，A 决定每圈怎么变换状态。展开后 h 里含有 A<sup>t</sup>，于是 A 的<b>谱半径 ρ(A)</b>（最大特征值的绝对值）决定一切：ρ &gt; 1 指数爆炸，ρ = 1 处于临界，ρ &lt; 1 收敛。</div>
+<div class="card ctl">
+  <span>循环次数 T</span><input id="T" type="range" min="2" max="64" value="48"><b id="Tt"></b>
+  <span style="color:var(--u)">无约束 A 的 ρ</span><input id="rho" type="range" min="0.80" max="1.40" step="0.01" value="1.25"><b id="rt"></b>
+  <span style="color:var(--p)">Parcae 原始参数 θ</span><input id="th" type="range" min="-4" max="4" step="0.05" value="0"><b id="tht"></b>
+  <span>‖B·e‖</span><input id="be" type="range" min="0.1" max="3" step="0.1" value="1"><b id="bet"></b>
+</div>
+<label class="cb small"><input type="checkbox" id="nl"> 加入一个小的非线性扰动 R（h 上叠加 0.1·tanh(h) 的噪声式项）</label>
+<canvas id="cv"></canvas>
+<div class="small"><span class="k" style="background:var(--u)"></span>无约束：A 是可学习的任意矩阵 <span class="k" style="background:var(--i)"></span>恒等：A = I（直接累加，ρ = 1） <span class="k" style="background:var(--p)"></span>Parcae：A = exp(Δ·(−exp θ))，负对角再离散化</div>
+<div class="card" id="out"></div>
+<p class="small">说明：这是讲座里“动力系统视角”的一维示意。Parcae 的做法是把 A 参数化为负对角矩阵并离散化，于是无论训练把 θ 学成多少，A 的每个对角元都落在 (0,1) 之间，ρ(A) &lt; 1；B 只作用一次，只需加一层归一化。Δ 在此固定为 1。</p>
+<script>
+(function(){
+const $=id=>document.getElementById(id);
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+function run(a,T,be,nl){ let h=1, out=[Math.abs(h)];
+  for(let t=0;t<T;t++){ h=a*h+be+(nl?0.1*Math.tanh(h):0); if(!isFinite(h)||Math.abs(h)>1e30) h=Math.sign(h||1)*1e30; out.push(Math.abs(h)); } return out; }
+function draw(){
+  const T=+$('T').value, rho=+$('rho').value, th=+$('th').value, be=+$('be').value, nl=$('nl').checked;
+  const ap=Math.exp(-Math.exp(th));
+  $('Tt').textContent=T; $('rt').textContent=rho.toFixed(2); $('tht').textContent=th.toFixed(2)+' → A='+ap.toFixed(3); $('bet').textContent=be.toFixed(1);
+  const curves=[['--u',run(rho,T,be,nl)],['--i',run(1,T,be,nl)],['--p',run(ap,T,be,nl)]];
+  const cv=$('cv'), ctx=cv.getContext('2d'), dpr=window.devicePixelRatio||1, W=cv.clientWidth, H=Math.max(220,Math.min(300,W*0.5));
+  cv.style.height=H+'px'; cv.width=W*dpr; cv.height=H*dpr; ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H);
+  const L=44,R=10,Tp=10,B=28,pw=W-L-R,ph=H-Tp-B;
+  let ymax=0; curves.forEach(c=>c[1].forEach(v=>ymax=Math.max(ymax,Math.log10(Math.max(v,1e-3))))); ymax=Math.max(2,Math.ceil(ymax));
+  const ymin=-1, X=t=>L+t/T*pw, Y=v=>Tp+ph-(Math.log10(Math.max(v,1e-3))-ymin)/(ymax-ymin)*ph;
+  ctx.font='11px sans-serif'; ctx.strokeStyle=css('--grid'); ctx.fillStyle=css('--muted');
+  const stepY=Math.max(1,Math.ceil((ymax-ymin)/6));
+  for(let e=ymin;e<=ymax;e+=stepY){ const y=Tp+ph-(e-ymin)/(ymax-ymin)*ph; ctx.beginPath(); ctx.moveTo(L,y); ctx.lineTo(L+pw,y); ctx.stroke(); ctx.textAlign='right'; ctx.fillText('1e'+e,L-4,y+4); }
+  ctx.textAlign='center'; for(let t=0;t<=T;t+=Math.max(1,Math.round(T/8))){ ctx.fillText(t,X(t),H-12); }
+  ctx.fillText('循环圈数 t', L+pw/2, H-1);
+  curves.forEach(([c,v])=>{ ctx.strokeStyle=css(c); ctx.lineWidth=2.2; ctx.beginPath(); v.forEach((y,t)=>{ const px=X(t),py=Y(y); t?ctx.lineTo(px,py):ctx.moveTo(px,py); }); ctx.stroke(); });
+  const f=v=>v>=1e6? v.toExponential(1) : v.toFixed(2);
+  const u=curves[0][1][T], i=curves[1][1][T], p=curves[2][1][T];
+  $('out').innerHTML='循环 '+T+' 圈后的 ‖h‖：<b style="color:var(--u)">无约束 '+f(u)+'</b>（ρ='+rho.toFixed(2)+(rho>1?'，大约按 '+rho.toFixed(2)+'<sup>t</sup> 增长':'')+'）；'+
+    '<b style="color:var(--i)">恒等 '+f(i)+'</b>（线性增长，“临界稳定”）；'+
+    '<b style="color:var(--p)">Parcae '+f(p)+'</b>（收敛到不动点 ‖B·e‖/(1−A) ≈ '+f(be/(1-ap))+'）。'+
+    (rho>1? '<br>试试把 T 拉大：ρ 只要比 1 大一点点，圈数一多就会冲到天文数字——这就是训练中 loss 尖峰和 NaN 的来源。':'');
+}
+['T','rho','th','be'].forEach(id=>$(id).oninput=draw); $('nl').onchange=draw;
+window.addEventListener('resize',draw);
+draw();
+})();
+</script>
+</body>
+</html>

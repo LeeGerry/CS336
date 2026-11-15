@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>梯度下降小球</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#6b7280;--card:#f5f7fa;--border:#d8dee4;--accent:#2563eb;--accent-soft:#dbeafe;--warn:#d97706;--good:#059669;--bad:#dc2626;--curve:#334155}
+@media (prefers-color-scheme: dark){:root{--bg:#16181d;--fg:#e6e8eb;--muted:#9aa3ae;--card:#1f232a;--border:#363c45;--accent:#60a5fa;--accent-soft:#1e3a5f;--warn:#fbbf24;--good:#34d399;--bad:#f87171;--curve:#cbd5e1}}
+*{box-sizing:border-box}
+select{max-width:100%}
+label{max-width:100%}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+body{padding:12px;overflow-x:hidden}
+h3{margin:0 0 6px;font-size:16px}
+.muted{color:var(--muted);font-size:12.5px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin:8px 0}
+button,select{font:inherit;padding:5px 12px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg);cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button:disabled{opacity:.5;cursor:default}
+input[type=range]{flex:1;min-width:120px}
+label{white-space:nowrap}
+canvas{width:100%;height:260px;display:block;border:1px solid var(--border);border-radius:8px;background:var(--bg);touch-action:none}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
+.stat{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:6px}
+.stat div{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 8px}
+.stat b{display:block;font-size:15px}
+.msg{font-weight:600}
+.msg.bad{color:var(--bad)}.msg.good{color:var(--good)}
+</style>
+</head>
+<body>
+<h3>梯度下降：让小球沿着斜坡往下滚</h3>
+<div class="muted">曲线是损失函数 f(x)。每一步按 x ← x − 学习率 × f′(x) 更新。点击曲线可以把小球放到任意起点。</div>
+
+<div class="row">
+  <label>函数：</label>
+  <select id="fn">
+    <option value="bowl">碗形 f(x) = (x − 3)²</option>
+    <option value="steep">陡峭碗 f(x) = 4(x − 1)²</option>
+    <option value="double">双山谷 f(x) = 0.05x⁴ − 0.8x² + 0.3x + 4</option>
+  </select>
+</div>
+<div class="row">
+  <label>学习率 η = <span id="lrv" class="mono"></span></label>
+  <input id="lr" type="range" min="0.005" max="1.2" step="0.005" value="0.1">
+</div>
+<div class="row">
+  <button id="step" class="primary">单步</button>
+  <button id="play">自动播放</button>
+  <button id="reset">重置</button>
+  <span id="msg" class="msg"></span>
+</div>
+
+<canvas id="cv"></canvas>
+
+<div class="card">
+  <div class="stat">
+    <div>步数<b id="sStep">0</b></div>
+    <div>当前 x<b id="sX" class="mono">0</b></div>
+    <div>损失 f(x)<b id="sF" class="mono">0</b></div>
+    <div>梯度 f′(x)<b id="sG" class="mono">0</b></div>
+  </div>
+  <div class="mono" id="formula" style="margin-top:8px"></div>
+</div>
+<div class="muted">试试看：碗形函数下把 η 调到 0.9 左右会来回震荡，超过 1.0 会越跳越远（发散）；双山谷函数从右边出发会卡在“局部最低点”。</div>
+
+<script>
+(function(){
+  var FNS = {
+    bowl:{f:function(x){return (x-3)*(x-3);}, d:function(x){return 2*(x-3);}, xmin:-2, xmax:8, x0:-1},
+    steep:{f:function(x){return 4*(x-1)*(x-1);}, d:function(x){return 8*(x-1);}, xmin:-3, xmax:5, x0:-2},
+    double:{f:function(x){return 0.05*Math.pow(x,4)-0.8*x*x+0.3*x+4;}, d:function(x){return 0.2*x*x*x-1.6*x+0.3;}, xmin:-5, xmax:5, x0:4.2}
+  };
+  var cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+  var fnSel=document.getElementById('fn'), lr=document.getElementById('lr');
+  var state={x:0, steps:0, trail:[], playing:false, timer:null, diverged:false};
+  function F(){return FNS[fnSel.value];}
+  function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
+  function fmt(v){ if(!isFinite(v)) return '∞'; var a=Math.abs(v); if(a>=1e4) return v.toExponential(2); return v.toFixed(4).replace(/\.?0+$/,'')||'0'; }
+  var W=0,H=0,yMin=0,yMax=1;
+  function resize(){
+    var r=cv.getBoundingClientRect(), dpr=window.devicePixelRatio||1;
+    W=r.width; H=r.height; cv.width=Math.round(W*dpr); cv.height=Math.round(H*dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0); draw();
+  }
+  function computeYRange(){
+    var fn=F(), lo=Infinity, hi=-Infinity;
+    for(var i=0;i<=200;i++){var x=fn.xmin+(fn.xmax-fn.xmin)*i/200, y=fn.f(x); lo=Math.min(lo,y); hi=Math.max(hi,y);}
+    var pad=(hi-lo)*0.08; yMin=lo-pad; yMax=hi+pad;
+  }
+  var PL=36,PR=10,PT=10,PB=24;
+  function sx(x){var fn=F(); return PL+(x-fn.xmin)/(fn.xmax-fn.xmin)*(W-PL-PR);}
+  function sy(y){return PT+(1-(y-yMin)/(yMax-yMin))*(H-PT-PB);}
+  function draw(){
+    var fn=F(); ctx.clearRect(0,0,W,H);
+    // axes
+    ctx.strokeStyle=css('--border'); ctx.lineWidth=1; ctx.beginPath();
+    ctx.moveTo(PL,PT); ctx.lineTo(PL,H-PB); ctx.lineTo(W-PR,H-PB); ctx.stroke();
+    ctx.fillStyle=css('--muted'); ctx.font='11px sans-serif'; ctx.textAlign='center';
+    for(var t=Math.ceil(fn.xmin); t<=fn.xmax; t++){ ctx.fillText(String(t), sx(t), H-PB+14); }
+    ctx.textAlign='left'; ctx.fillText('f(x)',4,PT+10); ctx.textAlign='right'; ctx.fillText('x',W-PR,H-PB-4);
+    // curve
+    ctx.strokeStyle=css('--curve'); ctx.lineWidth=2; ctx.beginPath();
+    for(var i=0;i<=300;i++){var x=fn.xmin+(fn.xmax-fn.xmin)*i/300; var px=sx(x), py=sy(fn.f(x)); if(i===0)ctx.moveTo(px,py); else ctx.lineTo(px,py);} ctx.stroke();
+    // trail
+    var tr=state.trail;
+    ctx.strokeStyle=css('--warn'); ctx.lineWidth=1.5; ctx.setLineDash([4,3]); ctx.beginPath();
+    var started=false;
+    for(var k=0;k<tr.length;k++){ var x2=tr[k]; if(x2<fn.xmin||x2>fn.xmax){started=false; continue;} var p={x:sx(x2),y:sy(fn.f(x2))}; if(!started){ctx.moveTo(p.x,p.y);started=true;} else ctx.lineTo(p.x,p.y);} ctx.stroke(); ctx.setLineDash([]);
+    for(var k2=0;k2<tr.length-1;k2++){ var xv=tr[k2]; if(xv<fn.xmin||xv>fn.xmax) continue; ctx.fillStyle=css('--warn'); ctx.globalAlpha=0.35+0.65*k2/Math.max(1,tr.length); ctx.beginPath(); ctx.arc(sx(xv),sy(fn.f(xv)),3,0,7); ctx.fill(); }
+    ctx.globalAlpha=1;
+    // ball + tangent
+    var x0=state.x;
+    if(x0>=fn.xmin && x0<=fn.xmax){
+      var y0=fn.f(x0), g=fn.d(x0), dx=(fn.xmax-fn.xmin)*0.12;
+      ctx.strokeStyle=css('--accent'); ctx.lineWidth=1.5; ctx.beginPath();
+      ctx.moveTo(sx(x0-dx),sy(y0-g*dx)); ctx.lineTo(sx(x0+dx),sy(y0+g*dx)); ctx.stroke();
+      // arrow showing step direction
+      var nx=x0-(+lr.value)*g;
+      ctx.strokeStyle=css('--good'); ctx.fillStyle=css('--good'); ctx.lineWidth=2;
+      var ay=H-PB-6, ax1=sx(x0), ax2=sx(Math.max(fn.xmin,Math.min(fn.xmax,nx)));
+      if(Math.abs(ax2-ax1)>2){ ctx.beginPath(); ctx.moveTo(ax1,ay); ctx.lineTo(ax2,ay); ctx.stroke(); var dir=ax2>ax1?1:-1; ctx.beginPath(); ctx.moveTo(ax2,ay); ctx.lineTo(ax2-dir*6,ay-4); ctx.lineTo(ax2-dir*6,ay+4); ctx.fill(); }
+      ctx.fillStyle=css('--bad'); ctx.beginPath(); ctx.arc(sx(x0),sy(y0)-7,7,0,7); ctx.fill();
+    }
+  }
+  function updateStats(){
+    var fn=F(), x=state.x, g=fn.d(x), eta=+lr.value;
+    document.getElementById('lrv').textContent=eta.toFixed(3);
+    document.getElementById('sStep').textContent=state.steps;
+    document.getElementById('sX').textContent=fmt(x);
+    document.getElementById('sF').textContent=fmt(fn.f(x));
+    document.getElementById('sG').textContent=fmt(g);
+    document.getElementById('formula').textContent='下一步：x_new = x − η·f′(x) = '+fmt(x)+' − '+eta.toFixed(3)+' × ('+fmt(g)+') = '+fmt(x-eta*g);
+    var m=document.getElementById('msg');
+    if(state.diverged){m.className='msg bad'; m.textContent='发散了！学习率太大，小球被弹出了视野。';}
+    else if(Math.abs(g)<1e-3 && state.steps>0){m.className='msg good'; m.textContent='梯度≈0，已到达（某个）谷底。';}
+    else {m.className='msg'; m.textContent='';}
+    document.getElementById('step').disabled=state.diverged;
+  }
+  function reset(x){
+    stop(); var fn=F(); state.x=(x===undefined)?fn.x0:x; state.steps=0; state.trail=[state.x]; state.diverged=false;
+    computeYRange(); draw(); updateStats();
+  }
+  function step(){
+    if(state.diverged) return;
+    var fn=F(), g=fn.d(state.x); state.x=state.x-(+lr.value)*g; state.steps++; state.trail.push(state.x);
+    if(state.trail.length>80) state.trail.shift();
+    var span=fn.xmax-fn.xmin;
+    if(!isFinite(state.x) || state.x<fn.xmin-span || state.x>fn.xmax+span){ state.diverged=true; stop(); }
+    draw(); updateStats();
+    if(state.playing && Math.abs(fn.d(state.x))<1e-4) stop();
+  }
+  function stop(){ state.playing=false; if(state.timer){clearInterval(state.timer); state.timer=null;} document.getElementById('play').textContent='自动播放'; }
+  document.getElementById('step').onclick=step;
+  document.getElementById('reset').onclick=function(){reset();};
+  document.getElementById('play').onclick=function(){
+    if(state.playing){stop();return;}
+    if(state.diverged) reset(F().x0);
+    state.playing=true; this.textContent='暂停'; state.timer=setInterval(step,350);
+  };
+  fnSel.onchange=function(){reset();};
+  lr.oninput=function(){updateStats(); draw();};
+  cv.addEventListener('pointerdown',function(e){
+    var r=cv.getBoundingClientRect(), fn=F(); var x=fn.xmin+(e.clientX-r.left-PL)/(W-PL-PR)*(fn.xmax-fn.xmin);
+    x=Math.max(fn.xmin,Math.min(fn.xmax,x)); reset(Math.round(x*100)/100);
+  });
+  window.addEventListener('resize',resize);
+  computeYRange(); reset(); resize();
+})();
+</script>
+</body>
+</html>

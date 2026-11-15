@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>四种分词对比</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#6b7280;--card:#f5f7fa;--border:#d8dee4;--accent:#2563eb;--accent-soft:#dbeafe;--warn:#d97706;--good:#059669;--bad:#dc2626;--bad-soft:#fecaca}
+@media (prefers-color-scheme: dark){:root{--bg:#16181d;--fg:#e6e8eb;--muted:#9aa3ae;--card:#1f232a;--border:#363c45;--accent:#60a5fa;--accent-soft:#1e3a5f;--warn:#fbbf24;--good:#34d399;--bad:#f87171;--bad-soft:#5b1f1f}}
+*{box-sizing:border-box}
+select{max-width:100%}
+label{max-width:100%}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+body{padding:12px;overflow-x:hidden}
+h3{margin:0 0 6px;font-size:16px}
+h4{margin:0;font-size:14px}
+.muted{color:var(--muted);font-size:12.5px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin:8px 0}
+button{font:inherit;padding:3px 9px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg);cursor:pointer;font-size:12.5px}
+textarea{font:inherit;width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg);min-height:50px;resize:vertical}
+input[type=range]{flex:1;min-width:120px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
+.toks{display:flex;flex-wrap:wrap;gap:3px;margin-top:6px;max-height:150px;overflow-y:auto}
+.tk{display:inline-flex;flex-direction:column;align-items:center;padding:2px 4px 1px;border-radius:4px;font-family:ui-monospace,Menlo,monospace;font-size:13px;min-width:14px}
+.tk small{font-size:9.5px;opacity:.7}
+.tk.unk{background:var(--bad-soft)!important;color:var(--bad);font-weight:700}
+.head{display:flex;flex-wrap:wrap;justify-content:space-between;gap:6px;align-items:baseline}
+.nums{font-size:12.5px;color:var(--muted)}
+.nums b{color:var(--fg)}
+.barrow{display:grid;grid-template-columns:64px 1fr 48px;gap:6px;align-items:center;font-size:12.5px;margin:3px 0}
+.bar{height:14px;background:var(--accent);border-radius:3px;transition:width .2s}
+details summary{cursor:pointer;color:var(--muted);font-size:12.5px}
+</style>
+</head>
+<body>
+<h3>字符 / 字节 / 单词 / BPE：四种分词方式对比</h3>
+<div class="muted">单词分词和 BPE 都需要先在“训练语料”上建词表（可展开下方查看/修改）。在下面输入任意文本，看四种方法各切成多少个 token。</div>
+
+<div class="card">
+  <div class="row" style="margin-top:0">
+    <span class="muted">示例：</span>
+    <button data-p="Hello, 🌍! 你好!">讲义例子</button>
+    <button data-p="the model learns the language of the data">常见英文</button>
+    <button data-p="I'll say supercalifragilisticexpialidocious!">生僻长词</button>
+    <button data-p="语言模型从数据中学习语言。">中文</button>
+    <button data-p="The price is 12345.67 dollars in 2026.">数字</button>
+  </div>
+  <textarea id="inp">Hello, 🌍! 你好!</textarea>
+  <div class="row">
+    <label>BPE 合并次数 = <b id="mv" class="mono">300</b></label>
+    <input id="merges" type="range" min="0" max="600" step="10" value="300">
+  </div>
+  <details>
+    <summary>训练语料（单词词表与 BPE 合并表都从这里学）</summary>
+    <textarea id="corpus" style="min-height:120px;margin-top:6px"></textarea>
+    <div class="row"><button id="retrain">用修改后的语料重新训练</button><span class="muted" id="trainInfo"></span></div>
+  </details>
+</div>
+
+<div class="card" id="cmp"></div>
+
+<div id="out"></div>
+
+<div class="muted">要点：字符法词表巨大且多数字符罕见；字节法词表只有 256 但序列最长（压缩率恒为 1）；单词法压缩率高，却会遇到没见过的词（红色 UNK）；BPE 介于两者之间，常见片段合成一个 token，罕见内容退回字节，永远不会出现 UNK。</div>
+
+<script>
+(function(){
+  var $=function(id){return document.getElementById(id);};
+  var enc=new TextEncoder(), dec=new TextDecoder('utf-8',{fatal:true});
+  var PRE=/'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+/gu;
+  var WORD=/[\p{L}\p{N}_]+|[^]/gu; // 近似 Python 的 \w+|.
+  var CORPUS=[
+    "The model reads the text and predicts the next token. A language model places a probability distribution over sequences of tokens.",
+    "We train the model on a large corpus of data. The data comes from the web, from books, and from code. Hello world! Hello again, world.",
+    "Tokenization converts a string into a sequence of integers, and the tokenizer can decode the integers back into the string.",
+    "The cat sat on the mat. The dog sat on the log. The quick brown fox jumps over the lazy dog. I say hello, you say goodbye.",
+    "In 2025 and 2026 the price went from 100 to 200 dollars. There are 365 days in a year and 24 hours in a day.",
+    "语言模型是一个概率模型。模型读入文本，然后预测下一个词。我们用大量的数据训练模型。你好，世界！你好，语言模型！",
+    "数据来自网页、书籍和代码。分词器把字符串变成整数序列，也能把整数序列还原成字符串。"
+  ].join("\n");
+  $('corpus').value=CORPUS;
+  var model={};
+  function chunks(text){ return (text.match(PRE)||[]); }
+  function mergeSeq(seq,a,b,nid){ var out=[],i=0; while(i<seq.length){ if(i+1<seq.length&&seq[i]===a&&seq[i+1]===b){out.push(nid);i+=2;} else {out.push(seq[i]);i++;} } return out; }
+  function train(){
+    var text=$('corpus').value;
+    // 单词词表
+    var words=text.match(WORD)||[], wv=new Map();
+    words.forEach(function(w){ if(!wv.has(w)) wv.set(w,wv.size); });
+    // BPE（预分词 + 按词频）
+    var freq=new Map();
+    chunks(text).forEach(function(c){ freq.set(c,(freq.get(c)||0)+1); });
+    var items=[]; freq.forEach(function(f,c){ items.push({seq:Array.from(enc.encode(c)),f:f}); });
+    var vocab={}; for(var i=0;i<256;i++) vocab[i]=[i];
+    var merges=[], MAX=600;
+    for(var m=0;m<MAX;m++){
+      var counts=new Map(), best=null, bc=0;
+      items.forEach(function(it){ var s=it.seq; for(var j=0;j+1<s.length;j++){ var k=s[j]*100000+s[j+1]; var v=(counts.get(k)||0)+it.f; counts.set(k,v); if(v>bc){bc=v;best=k;} } });
+      if(best===null) break;
+      var a=Math.floor(best/100000), b=best%100000, nid=256+m;
+      vocab[nid]=vocab[a].concat(vocab[b]); merges.push([a,b,nid]);
+      items.forEach(function(it){ it.seq=mergeSeq(it.seq,a,b,nid); });
+    }
+    model={wv:wv, vocab:vocab, merges:merges};
+    $('merges').max=merges.length; if(+$('merges').value>merges.length) $('merges').value=merges.length;
+    $('trainInfo').textContent='单词词表 '+wv.size+' 个；BPE 最多学到 '+merges.length+' 条合并。';
+  }
+  function show(arr){ try{ return dec.decode(new Uint8Array(arr)).replace(/ /g,'␣').replace(/\n/g,'↵'); }catch(e){ return arr.map(function(b){return '\\x'+b.toString(16).padStart(2,'0');}).join(''); } }
+  function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+  function col(id,mod){ var h=(id*137.508)%360; return 'hsla('+h.toFixed(0)+',70%,55%,.25)'; }
+  function run(){
+    var t=$('inp').value, nb=enc.encode(t).length, K=+$('merges').value; $('mv').textContent=K;
+    var res=[];
+    // 字符
+    var cps=Array.from(t);
+    res.push({name:'字符 Character', vocab:'≈150K（Unicode 码点）', toks:cps.map(function(c){var id=c.codePointAt(0);return {s:c===' '?'␣':c,id:id};}), note:'每个 Unicode 字符一个 token，编号 = ord(字符)。'});
+    // 字节
+    var bs=Array.from(enc.encode(t));
+    res.push({name:'字节 Byte', vocab:'256', toks:bs.map(function(b){ var s=b<128?String.fromCharCode(b):'\\x'+b.toString(16); if(b===32)s='␣'; if(b===10)s='↵'; return {s:s,id:b};}), note:'UTF-8 编码后的每个字节一个 token；中文 3 字节，emoji 4 字节。'});
+    // 单词
+    var ws=t.match(WORD)||[], unk=0;
+    res.push({name:'单词 Word', vocab:(model.wv.size+1)+'（语料中出现过的词 + UNK）', toks:ws.map(function(w){ if(model.wv.has(w)) return {s:w===' '?'␣':w,id:model.wv.get(w)}; unk++; return {s:'UNK',id:-1,unk:true,orig:w}; }), note:''});
+    res[2].note='按正则 \\w+|. 切分；语料里没见过的词只能记作 UNK（本次 '+unk+' 个）。';
+    // BPE
+    var ids=[];
+    chunks(t).forEach(function(c){ var s=Array.from(enc.encode(c)); for(var i=0;i<K;i++){ var m=model.merges[i]; s=mergeSeq(s,m[0],m[1],m[2]); } ids=ids.concat(s); });
+    res.push({name:'BPE', vocab:String(256+K)+'（256 + 合并数）', toks:ids.map(function(id){return {s:show(model.vocab[id]),id:id};}), note:'字节级 BPE，先预分词，再按学到的合并表依次合并。'});
+    var maxN=Math.max.apply(null,res.map(function(r){return r.toks.length;}))||1;
+    $('cmp').innerHTML='<h4 style="margin-bottom:4px">token 数对比（越短越好；共 '+nb+' 字节）</h4>'+res.map(function(r){ return '<div class="barrow"><span>'+r.name.split(' ')[0]+'</span><div><div class="bar" style="width:'+(r.toks.length/maxN*100).toFixed(1)+'%"></div></div><span class="mono">'+r.toks.length+'</span></div>'; }).join('');
+    $('out').innerHTML=res.map(function(r){
+      var ratio=r.toks.length?(nb/r.toks.length).toFixed(2):'-';
+      return '<div class="card"><div class="head"><h4>'+r.name+'</h4><span class="nums">token 数 <b>'+r.toks.length+'</b> · 压缩率 <b>'+ratio+'</b> 字节/token · 词表 <b>'+r.vocab+'</b></span></div><div class="muted">'+esc(r.note)+'</div><div class="toks">'+
+        r.toks.map(function(o){ return '<span class="tk'+(o.unk?' unk':'')+'" style="background:'+col(o.id)+'" title="'+(o.unk?esc('原词：'+o.orig):'id '+o.id)+'">'+esc(o.s)+'<small>'+(o.unk?'?':o.id)+'</small></span>'; }).join('')+'</div></div>';
+    }).join('');
+  }
+  $('inp').oninput=run; $('merges').oninput=run;
+  $('retrain').onclick=function(){ train(); run(); };
+  Array.prototype.forEach.call(document.querySelectorAll('[data-p]'),function(b){ b.onclick=function(){ $('inp').value=b.getAttribute('data-p'); run(); }; });
+  train(); run();
+})();
+</script>
+</body>
+</html>

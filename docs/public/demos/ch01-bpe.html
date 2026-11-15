@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BPE 训练动画</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#6b7280;--card:#f5f7fa;--border:#d8dee4;--accent:#2563eb;--accent-soft:#dbeafe;--warn:#d97706;--warn-soft:#fde68a;--good:#059669;--good-soft:#a7f3d0;--bad:#dc2626;--bad-soft:#fee2e2}
+@media (prefers-color-scheme: dark){:root{--bg:#16181d;--fg:#e6e8eb;--muted:#9aa3ae;--card:#1f232a;--border:#363c45;--accent:#60a5fa;--accent-soft:#1e3a5f;--warn:#fbbf24;--warn-soft:#6b5214;--good:#34d399;--good-soft:#14532d;--bad:#f87171;--bad-soft:#4c1d1d}}
+*{box-sizing:border-box}
+select{max-width:100%}
+label{max-width:100%}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+body{padding:12px;overflow-x:hidden}
+h3{margin:0 0 6px;font-size:16px}
+h4{margin:0 0 6px;font-size:14px}
+.muted{color:var(--muted);font-size:12.5px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin:8px 0}
+button,select{font:inherit;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg);cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.small{padding:2px 8px;font-size:12.5px}
+button:disabled{opacity:.5;cursor:default}
+textarea,input[type=text],input[type=number]{font:inherit;width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg)}
+input[type=number]{width:70px}
+textarea{min-height:56px;resize:vertical}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
+.toks{display:flex;flex-wrap:wrap;gap:3px;line-height:1}
+.chunk{display:inline-flex;gap:2px;padding:2px;border-radius:5px;border:1px dashed transparent}
+.toks.pre .chunk{border-color:var(--border)}
+.tk{display:inline-flex;flex-direction:column;align-items:center;padding:3px 4px 2px;border-radius:4px;font-family:ui-monospace,Menlo,monospace;font-size:13px;min-width:16px;border:1px solid transparent;transition:background .25s}
+.tk small{font-size:9.5px;opacity:.7;margin-top:2px}
+.tk.next{outline:2px solid var(--warn);outline-offset:0}
+.tk.new{animation:pop .6s ease}
+@keyframes pop{0%{transform:scale(1.35)}100%{transform:scale(1)}}
+.stat{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:6px}
+.stat div{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 8px}
+.stat b{display:block;font-size:15px}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+@media (max-width:560px){.cols{grid-template-columns:1fr}}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th,td{padding:3px 4px;border-bottom:1px solid var(--border);text-align:left;vertical-align:top}
+tr.chosen td{background:var(--warn-soft)}
+.scroll{max-height:210px;overflow-y:auto}
+.ok{color:var(--good);font-weight:600}.bad{color:var(--bad);font-weight:600}
+.presets{display:flex;flex-wrap:wrap;gap:4px}
+</style>
+</head>
+<body>
+<h3>BPE 训练：一步一步合并最常见的相邻对</h3>
+<div class="muted">从 UTF-8 字节出发（初始词表 256 个），每一步：数所有相邻 token 对 → 选出现最多的一对 → 造一个新 token（编号 256, 257, …）→ 在序列里替换掉它。</div>
+
+<div class="card">
+  <div class="presets" style="margin-bottom:6px">
+    <span class="muted">示例：</span>
+    <button class="small" data-p="the cat in the hat">讲义例子</button>
+    <button class="small" data-p="low low low low low lower lower newest newest newest newest newest newest widest widest widest">low/newest</button>
+    <button class="small" data-p="the quick brown fox jumps over the lazy dog. the dog sleeps. the fox runs.">英文句子</button>
+    <button class="small" data-p="我爱北京。北京是中国的首都。我爱中国。">中文</button>
+    <button class="small" data-p="2024 2025 2026 1000 1001 1002">数字</button>
+  </div>
+  <textarea id="text">the cat in the hat</textarea>
+  <div class="row">
+    <label>最多合并 <input type="number" id="maxm" value="10" min="1" max="500"> 次</label>
+    <label><input type="checkbox" id="pre"> 预分词（GPT-2 风格，合并不跨越“词”）</label>
+  </div>
+  <div class="row">
+    <label>平局时：<select id="tie">
+      <option value="first">先出现的对优先（同讲义代码 max()）</option>
+      <option value="lex">字节序更大的对优先（作业 1 的约定）</option>
+    </select></label>
+  </div>
+  <div class="row">
+    <button id="step" class="primary">单步合并</button>
+    <button id="play">自动播放</button>
+    <button id="reset">重置（用上面的文本重新开始）</button>
+    <label class="muted">速度 <input type="range" id="speed" min="150" max="1500" value="700" style="width:90px;vertical-align:middle"></label>
+  </div>
+</div>
+
+<div class="card">
+  <div class="stat">
+    <div>已合并<b id="sM">0</b></div>
+    <div>字节数<b id="sB">0</b></div>
+    <div>token 数<b id="sT">0</b></div>
+    <div>压缩率 字节/token<b id="sR">1.00</b></div>
+    <div>词表大小<b id="sV">256</b></div>
+  </div>
+  <h4 style="margin-top:10px">当前 token 序列 <span class="muted">（黄框 = 下一步将被合并的对；小字是 token 编号；␣ 表示空格）</span></h4>
+  <div id="toks" class="toks"></div>
+  <div id="note" class="muted" style="margin-top:6px"></div>
+</div>
+
+<div class="cols">
+  <div class="card">
+    <h4>相邻对计数（前 10）</h4>
+    <div class="scroll"><table><thead><tr><th>对</th><th>内容</th><th>次数</th></tr></thead><tbody id="pairs"></tbody></table></div>
+  </div>
+  <div class="card">
+    <h4>合并表 merges（= 学到的规则，按顺序）</h4>
+    <div class="scroll"><table><thead><tr><th>#</th><th>(a, b)</th><th>→ 新 token</th></tr></thead><tbody id="merges"></tbody></table></div>
+  </div>
+</div>
+
+<div class="card">
+  <h4>用学到的合并表给新文本编码</h4>
+  <input type="text" id="enc" value="the quick brown fox">
+  <div class="muted" style="margin:4px 0">编码 = 先转成字节，再按合并表的顺序依次应用每条规则。解码 = 查词表把每个 token 还原成字节再拼接。</div>
+  <div id="encToks" class="toks"></div>
+  <div id="encInfo" class="mono" style="margin-top:6px"></div>
+</div>
+
+<script>
+(function(){
+  var $=function(id){return document.getElementById(id);};
+  var enc=new TextEncoder(), dec=new TextDecoder('utf-8',{fatal:true});
+  var PRE=/'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+/gu;
+  var S={}; var timer=null;
+  function initVocab(){ var v={}; for(var i=0;i<256;i++) v[i]=[i]; return v; }
+  function showBytes(arr){
+    try{ var s=dec.decode(new Uint8Array(arr)); return s.replace(/ /g,'␣').replace(/\n/g,'↵').replace(/\t/g,'⇥'); }
+    catch(e){ return arr.map(function(b){return '\\x'+b.toString(16).padStart(2,'0');}).join(''); }
+  }
+  function color(id){
+    if(id<256) return 'hsla(0,0%,50%,.13)';
+    var h=(id*137.508)%360; return 'hsla('+h.toFixed(0)+',75%,55%,.28)';
+  }
+  function chunksOf(text){
+    if(!$('pre').checked) return [Array.from(enc.encode(text))];
+    var m=text.match(PRE)||[]; return m.map(function(c){return Array.from(enc.encode(c));});
+  }
+  function reset(){
+    stop();
+    var text=$('text').value;
+    S={text:text, chunks:chunksOf(text), vocab:initVocab(), merges:[], nbytes:enc.encode(text).length, lastNew:-1};
+    render();
+  }
+  function countPairs(){
+    var counts=new Map(), order=[];
+    S.chunks.forEach(function(c){ for(var i=0;i+1<c.length;i++){ var k=c[i]+','+c[i+1]; if(!counts.has(k)){counts.set(k,0);order.push(k);} counts.set(k,counts.get(k)+1);} });
+    return {counts:counts, order:order};
+  }
+  function cmpBytes(a,b){ for(var i=0;i<Math.min(a.length,b.length);i++){ if(a[i]!==b[i]) return a[i]-b[i]; } return a.length-b.length; }
+  function bestPair(pc){
+    var best=null, bc=0, tie=$('tie').value;
+    pc.order.forEach(function(k){
+      var c=pc.counts.get(k);
+      if(c>bc){best=k;bc=c;}
+      else if(c===bc && tie==='lex' && best){
+        var p=k.split(',').map(Number), q=best.split(',').map(Number);
+        var d=cmpBytes(S.vocab[p[0]],S.vocab[q[0]]); if(d===0) d=cmpBytes(S.vocab[p[1]],S.vocab[q[1]]);
+        if(d>0){best=k;}
+      }
+    });
+    return best?{pair:best.split(',').map(Number),count:bc}:null;
+  }
+  function mergeSeq(seq,a,b,nid){ var out=[],i=0; while(i<seq.length){ if(i+1<seq.length&&seq[i]===a&&seq[i+1]===b){out.push(nid);i+=2;} else {out.push(seq[i]);i++;} } return out; }
+  function step(){
+    var pc=countPairs(), bp=bestPair(pc);
+    if(!bp){ $('note').textContent='已经没有相邻对可以合并了（每段都只剩 1 个 token）。'; stop(); return false; }
+    if(S.merges.length>=+$('maxm').value){ $('note').textContent='达到设定的最多合并次数。'; stop(); return false; }
+    var nid=256+S.merges.length, a=bp.pair[0], b=bp.pair[1];
+    S.vocab[nid]=S.vocab[a].concat(S.vocab[b]);
+    S.merges.push({a:a,b:b,id:nid,count:bp.count});
+    S.chunks=S.chunks.map(function(c){return mergeSeq(c,a,b,nid);});
+    S.lastNew=nid; render(); return true;
+  }
+  function tokHTML(id,cls){ return '<span class="tk '+(cls||'')+'" style="background:'+color(id)+'">'+escapeHTML(showBytes(S.vocab[id]))+'<small>'+id+'</small></span>'; }
+  function escapeHTML(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+  function render(){
+    var pc=countPairs(), bp=bestPair(pc);
+    var ntok=S.chunks.reduce(function(a,c){return a+c.length;},0);
+    $('sM').textContent=S.merges.length; $('sB').textContent=S.nbytes; $('sT').textContent=ntok;
+    $('sR').textContent=ntok?(S.nbytes/ntok).toFixed(2):'-'; $('sV').textContent=256+S.merges.length;
+    var h='';
+    S.chunks.forEach(function(c){
+      h+='<span class="chunk">';
+      var i=0;
+      while(i<c.length){
+        if(bp && i+1<c.length && c[i]===bp.pair[0] && c[i+1]===bp.pair[1]){ h+=tokHTML(c[i],'next')+tokHTML(c[i+1],'next'); i+=2; }
+        else { h+=tokHTML(c[i], c[i]===S.lastNew?'new':''); i++; }
+      }
+      h+='</span>';
+    });
+    $('toks').innerHTML=h; $('toks').className='toks'+($('pre').checked?' pre':'');
+    if(bp) $('note').innerHTML='下一步将合并 <b>('+bp.pair[0]+', '+bp.pair[1]+')</b> = “'+escapeHTML(showBytes(S.vocab[bp.pair[0]]))+'” + “'+escapeHTML(showBytes(S.vocab[bp.pair[1]]))+'”，出现 '+bp.count+' 次 → 新 token '+(256+S.merges.length)+'。';
+    else $('note').textContent='没有可合并的相邻对了。';
+    // pairs table
+    var arr=pc.order.map(function(k,idx){return {k:k,c:pc.counts.get(k),idx:idx};});
+    arr.sort(function(x,y){return y.c-x.c||x.idx-y.idx;});
+    var bestKey=bp?bp.pair.join(','):'';
+    // ensure chosen shows first
+    arr.sort(function(x,y){ if(x.k===bestKey) return -1; if(y.k===bestKey) return 1; return 0; });
+    $('pairs').innerHTML=arr.slice(0,10).map(function(o){ var p=o.k.split(',').map(Number); return '<tr class="'+(o.k===bestKey?'chosen':'')+'"><td class="mono">('+p[0]+', '+p[1]+')</td><td class="mono">'+escapeHTML(showBytes(S.vocab[p[0]].concat(S.vocab[p[1]])))+'</td><td>'+o.c+'</td></tr>'; }).join('')||'<tr><td colspan="3" class="muted">无</td></tr>';
+    $('merges').innerHTML=S.merges.map(function(m,i){ return '<tr><td>'+(i+1)+'</td><td class="mono">('+m.a+', '+m.b+')<br><span class="muted">“'+escapeHTML(showBytes(S.vocab[m.a]))+'”+“'+escapeHTML(showBytes(S.vocab[m.b]))+'”</span></td><td class="mono">'+m.id+' “'+escapeHTML(showBytes(S.vocab[m.id]))+'”<br><span class="muted">出现 '+m.count+' 次</span></td></tr>'; }).reverse().join('')||'<tr><td colspan="3" class="muted">还没有合并</td></tr>';
+    $('step').disabled=!bp||S.merges.length>=+$('maxm').value;
+    encode();
+  }
+  function encode(){
+    var t=$('enc').value, chunks;
+    if($('pre').checked){ chunks=(t.match(PRE)||[]).map(function(c){return Array.from(enc.encode(c));}); }
+    else chunks=[Array.from(enc.encode(t))];
+    S.merges.forEach(function(m){ chunks=chunks.map(function(c){return mergeSeq(c,m.a,m.b,m.id);}); });
+    var ids=[].concat.apply([],chunks);
+    $('encToks').innerHTML=ids.map(function(id){return tokHTML(id);}).join('');
+    var bytes=[].concat.apply([],ids.map(function(id){return S.vocab[id];}));
+    var back; try{ back=dec.decode(new Uint8Array(bytes)); }catch(e){ back=null; }
+    var nb=enc.encode(t).length;
+    $('encInfo').innerHTML='indices = ['+ids.join(', ')+']<br>'+nb+' 字节 → '+ids.length+' 个 token，压缩率 '+(ids.length?(nb/ids.length).toFixed(2):'-')+'；解码还原：'+(back===t?'<span class="ok">一致 ✓</span>':'<span class="bad">不一致 ✗</span>');
+  }
+  function stop(){ if(timer){clearTimeout(timer);timer=null;} $('play').textContent='自动播放'; }
+  function loop(){ if(step()) timer=setTimeout(loop, +$('speed').value); else stop(); }
+  $('step').onclick=function(){stop(); step();};
+  $('play').onclick=function(){ if(timer){stop();return;} this.textContent='暂停'; loop(); };
+  $('reset').onclick=reset;
+  $('pre').onchange=reset; $('tie').onchange=reset;
+  $('maxm').onchange=function(){ render(); };
+  $('enc').oninput=encode;
+  Array.prototype.forEach.call(document.querySelectorAll('[data-p]'),function(b){ b.onclick=function(){ $('text').value=b.getAttribute('data-p'); reset(); }; });
+  reset();
+})();
+</script>
+</body>
+</html>

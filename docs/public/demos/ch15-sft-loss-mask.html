@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SFT 损失掩码</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#656d76;--card:#f6f8fa;--border:#d0d7de;--accent:#2563eb;
+--sys:#7c3aed;--user:#0891b2;--asst:#16a34a;--special:#9ca3af;--off:#e5e7eb;--warn:#d97706}
+@media (prefers-color-scheme: dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8b949e;--card:#161b22;--border:#30363d;--accent:#58a6ff;
+--sys:#a78bfa;--user:#22d3ee;--asst:#4ade80;--special:#6b7280;--off:#21262d;--warn:#f59e0b}}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+h3{margin:0 0 8px;font-size:16px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px}
+select,button{font:inherit;padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--fg);cursor:pointer}
+button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+label{display:inline-flex;align-items:center;gap:4px;cursor:pointer}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px}
+.tokens{display:flex;flex-wrap:wrap;gap:3px}
+.tok{position:relative;padding:2px 5px;border-radius:4px;font-size:13px;border:2px solid transparent;white-space:pre;cursor:default;min-width:14px;text-align:center}
+.tok.in{color:#fff}
+.tok.out{background:var(--off);color:var(--muted)}
+.tok.r-system.in{background:var(--sys)}.tok.r-user.in{background:var(--user)}.tok.r-assistant.in{background:var(--asst)}.tok.r-special.in{background:var(--special)}
+.tok.r-system.out{border-color:var(--sys)}.tok.r-user.out{border-color:var(--user)}.tok.r-assistant.out{border-color:var(--asst)}.tok.r-special.out{border-color:var(--special)}
+.tok.hl{outline:2px solid var(--warn);outline-offset:1px}
+.nl{flex-basis:100%;height:0}
+.legend{display:flex;flex-wrap:wrap;gap:10px;font-size:12px;color:var(--muted)}
+.sw{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:middle;margin-right:3px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
+.stat{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 8px}
+.stat b{display:block;font-size:18px}
+.stat span{font-size:12px;color:var(--muted)}
+#info{min-height:42px;font-size:13px}
+.bars{display:flex;align-items:flex-end;gap:1px;height:60px;margin-top:6px}
+.bar{flex:1;min-width:1px;border-radius:1px 1px 0 0}
+.note{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<h3>SFT 对话模板 + 损失掩码：哪些 token 计算损失？</h3>
+<div class="row">
+  <label>样例：<select id="sample">
+    <option value="0">单轮问答</option>
+    <option value="1">多轮对话</option>
+    <option value="2">工具调用（智能体）</option>
+  </select></label>
+  <label>掩码策略：<select id="mode">
+    <option value="asst">只算所有助手回答</option>
+    <option value="last">只算最后一轮助手回答</option>
+    <option value="all">全部 token（像预训练/中训练）</option>
+  </select></label>
+  <label><input type="checkbox" id="eos" checked>回答的结束标记也计入</label>
+</div>
+<div class="legend">
+  <span><i class="sw" style="background:var(--sys)"></i>系统提示</span>
+  <span><i class="sw" style="background:var(--user)"></i>用户 / 工具返回</span>
+  <span><i class="sw" style="background:var(--asst)"></i>助手回答</span>
+  <span><i class="sw" style="background:var(--special)"></i>模板特殊标记</span>
+  <span>实心 = 计入损失，空心灰底 = 掩掉（标签设为 -100）</span>
+</div>
+<div class="card"><div class="tokens" id="tokens"></div></div>
+<div class="card" id="info">把鼠标移到（或点按）某个 token 上，看它在训练时扮演什么角色。</div>
+<div class="card">
+  <div class="stats">
+    <div class="stat"><b id="sTotal">0</b><span>序列总 token 数</span></div>
+    <div class="stat"><b id="sIn">0</b><span>计入损失的 token 数</span></div>
+    <div class="stat"><b id="sFrac">0%</b><span>参与训练的比例</span></div>
+    <div class="stat"><b id="sLoss">0</b><span>平均损失（模拟值）</span></div>
+  </div>
+  <div class="bars" id="bars"></div>
+  <div class="note">上方条形图：每个 token 的模拟交叉熵（提示部分通常更难预测、损失更高）。只有实心颜色的条会被加起来求平均。切换策略，观察平均损失的分母和数值如何变化。</div>
+</div>
+<div class="note">分词仅为示意（中文按字、英文按词切分），真实模型使用 BPE 分词器，模板标记也因模型而异。</div>
+<script>
+(function(){
+var samples=[
+ [{role:'system',text:'你是一个乐于助人的助手。'},{role:'user',text:'1+1 等于几？'},{role:'assistant',text:'1+1 等于 2。'}],
+ [{role:'system',text:'你是一个简洁的助手。'},{role:'user',text:'推荐一种入门编程语言。'},{role:'assistant',text:'推荐 Python，语法简单。'},{role:'user',text:'那移动端呢？'},{role:'assistant',text:'安卓选 Kotlin，iOS 选 Swift。'}],
+ [{role:'system',text:'你可以调用 weather 工具。'},{role:'user',text:'北京今天冷吗？'},{role:'assistant',text:'{"tool":"weather","city":"北京"}'},{role:'tool',text:'{"temp":-3}'},{role:'assistant',text:'今天零下 3 度，很冷，注意保暖。'}]
+];
+function split(t){var m=t.match(/[A-Za-z]+|[0-9]+|\s+|[一-鿿]|[^\sA-Za-z0-9一-鿿]/g);return m||[];}
+function hash(s){var h=2166136261;for(var i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619);}return (h>>>0)/4294967295;}
+var toks=[];
+function build(){
+  var conv=samples[+document.getElementById('sample').value];
+  toks=[];
+  var lastAsst=-1;conv.forEach(function(m,i){if(m.role==='assistant')lastAsst=i;});
+  conv.forEach(function(m,i){
+    var turn=i;
+    var roleName=m.role;
+    toks.push({t:'<|im_start|>',role:'special',owner:roleName,turn:turn,kind:'head'});
+    toks.push({t:roleName,role:'special',owner:roleName,turn:turn,kind:'head'});
+    toks.push({t:'\\n',role:'special',owner:roleName,turn:turn,kind:'head'});
+    split(m.text).forEach(function(w){
+      toks.push({t:w,role:(roleName==='tool'?'user':roleName),owner:roleName,turn:turn,kind:'body'});
+    });
+    toks.push({t:'<|im_end|>',role:'special',owner:roleName,turn:turn,kind:'end',isLast:(i===lastAsst)});
+    toks.push({nl:true});
+  });
+  toks.lastAsst=lastAsst;
+}
+function inLoss(k){
+  var mode=document.getElementById('mode').value, eos=document.getElementById('eos').checked;
+  if(mode==='all')return true;
+  if(k.owner!=='assistant')return false;
+  if(mode==='last'&&k.turn!==toks.lastAsst)return false;
+  if(k.kind==='head')return false;
+  if(k.kind==='end')return eos;
+  return true;
+}
+function fakeLoss(k,idx){
+  var base=k.owner==='assistant'?0.6:(k.owner==='system'?2.4:2.0);
+  if(k.kind!=='body')base=0.15;
+  return +(base*(0.4+1.2*hash(k.t+idx))).toFixed(2);
+}
+function render(){
+  var box=document.getElementById('tokens');box.innerHTML='';
+  var bars=document.getElementById('bars');bars.innerHTML='';
+  var total=0,inc=0,sum=0,maxL=0,real=[];
+  toks.forEach(function(k,idx){
+    if(k.nl){var d=document.createElement('div');d.className='nl';box.appendChild(d);return;}
+    total++;k.loss=fakeLoss(k,idx);k.inl=inLoss(k);real.push(k);
+    if(k.loss>maxL)maxL=k.loss;
+    if(k.inl){inc++;sum+=k.loss;}
+    var s=document.createElement('span');
+    s.className='tok r-'+k.role+(k.inl?' in':' out');
+    s.textContent=k.t;
+    s.addEventListener('mouseenter',function(){show(k,s);});
+    s.addEventListener('click',function(){show(k,s);});
+    box.appendChild(s);
+  });
+  real.forEach(function(k){
+    var b=document.createElement('div');b.className='bar';
+    b.style.height=(k.loss/maxL*100)+'%';
+    var col={system:'var(--sys)',user:'var(--user)',assistant:'var(--asst)',special:'var(--special)'}[k.role];
+    b.style.background=k.inl?col:'var(--off)';
+    bars.appendChild(b);
+  });
+  document.getElementById('sTotal').textContent=total;
+  document.getElementById('sIn').textContent=inc;
+  document.getElementById('sFrac').textContent=(total?Math.round(inc/total*100):0)+'%';
+  document.getElementById('sLoss').textContent=inc?(sum/inc).toFixed(3):'—';
+}
+var lastEl=null;
+function show(k,el){
+  if(lastEl)lastEl.classList.remove('hl');el.classList.add('hl');lastEl=el;
+  var roleCn={system:'系统提示',user:'用户输入',assistant:'助手回答',tool:'工具返回'}[k.owner];
+  var kindCn={head:'轮次开头的模板标记',body:'正文',end:'轮次结束标记'}[k.kind];
+  var msg='token「'+k.t+'」属于 <b>'+roleCn+'</b> 的'+kindCn+'。 模拟损失 '+k.loss+'。 ';
+  if(k.inl)msg+='<b style="color:var(--asst)">计入损失</b>：模型要学会在这个位置输出它。';
+  else msg+='<b style="color:var(--muted)">不计入损失</b>：它仍作为输入参与前向计算（模型能“看到”它），但对应的预测目标被掩掉，不产生梯度。';
+  if(k.kind==='end'&&k.owner==='assistant')msg+=' 提示：如果不学结束标记，模型推理时可能停不下来。';
+  if(k.owner==='tool')msg+=' 工具返回的内容来自外部环境，模型不该去“模仿”它，所以通常掩掉。';
+  document.getElementById('info').innerHTML=msg;
+}
+['sample','mode','eos'].forEach(function(id){document.getElementById(id).addEventListener('change',function(){if(id==='sample')build();render();});});
+build();render();
+})();
+</script>
+</body>
+</html>

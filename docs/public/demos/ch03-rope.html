@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RoPE 旋转位置编码</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#656d76;--card:#f6f8fa;--border:#d0d7de;--q:#0969da;--k:#bf3989;--grid:#d8dee4;--good:#1a7f37;}
+@media (prefers-color-scheme: dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8d96a0;--card:#161b22;--border:#30363d;--q:#4493f8;--k:#db61a2;--grid:#30363d;--good:#3fb950;}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+.wrap{max-width:760px;margin:0 auto;padding:12px}
+h3{margin:4px 0 8px;font-size:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px}
+.grid2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px;align-items:start}
+@media (max-width:560px){.grid2{grid-template-columns:1fr}}
+canvas{width:100%;display:block;background:var(--bg);border:1px solid var(--border);border-radius:6px}
+.ctl{display:flex;align-items:center;gap:6px;margin:4px 0;font-size:13px}
+.ctl span.n{min-width:64px}
+.ctl input[type=range]{flex:1;min-width:0}
+.ctl b{min-width:34px;text-align:right;font-variant-numeric:tabular-nums}
+button{background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:13px;cursor:pointer}
+.read{font-size:13px;font-variant-numeric:tabular-nums}
+.read .big{font-size:18px;font-weight:700;color:var(--good)}
+.small{font-size:12px;color:var(--muted)}
+.dials{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
+.dial{text-align:center;font-size:11px;color:var(--muted)}
+.dial canvas{border:none;background:none}
+.tabs{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap}
+.tabs button.on{background:var(--q);color:#fff;border-color:var(--q)}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h3>RoPE：用“旋转角度”表示位置</h3>
+<div class="tabs"><button id="t1" class="on">① 二维旋转与相对位置</button><button id="t2">② 多频率“表盘”</button></div>
+
+<div id="p1">
+<div class="grid2">
+  <div><canvas id="cv" width="360" height="360"></canvas></div>
+  <div class="card">
+    <div class="ctl"><span class="n">q 的位置 m</span><input type="range" id="m" min="0" max="20" value="3"><b id="mv"></b></div>
+    <div class="ctl"><span class="n">k 的位置 n</span><input type="range" id="n" min="0" max="20" value="1"><b id="nv"></b></div>
+    <div class="ctl"><span class="n">每步角度 θ</span><input type="range" id="th" min="5" max="90" value="25"><b id="thv"></b></div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin:6px 0">
+      <button id="shift">整句右移 1 位（m、n 同时 +1）</button>
+      <button id="anim">连续平移动画</button>
+    </div>
+    <div class="read" id="read1"></div>
+    <div class="small" style="margin-top:6px">虚线是旋转前的原始向量（与位置无关的“语义”向量）。实线是旋转后的向量。只要 m − n 不变，两个实线向量的夹角就不变，所以点积（注意力打分）不变。</div>
+  </div>
+</div>
+</div>
+
+<div id="p2" style="display:none">
+<div class="card">
+  <div class="ctl"><span class="n">位置 m</span><input type="range" id="pos" min="0" max="400" value="0"><b id="posv"></b></div>
+  <div style="display:flex;gap:6px;margin:4px 0"><button id="play2">播放</button><span class="small">把 d = 8 维向量切成 4 对，每一对按不同频率 θ<sub>i</sub> = 10000<sup>−2i/d</sup> 旋转。</span></div>
+  <div class="dials" id="dials"></div>
+</div>
+<div class="card">
+  <div style="font-weight:600;font-size:13px">把 q 和 k 设成同一个向量，只改变相对距离 m − n，看点积如何变化（d = 64）</div>
+  <canvas id="cv2" width="700" height="220"></canvas>
+  <div class="small">距离为 0 时点积最大；距离增大后总体趋势是变小、并伴随振荡——高频维度负责分辨“紧挨着的邻居”，低频维度负责“远距离”的粗略位置。</div>
+</div>
+</div>
+</div>
+
+<script>
+(function(){
+  function css(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+  var $=function(id){return document.getElementById(id);};
+  var qv=[1.0,0.35], kv=[0.8,0.6];
+  function rot(v,a){ return [v[0]*Math.cos(a)-v[1]*Math.sin(a), v[0]*Math.sin(a)+v[1]*Math.cos(a)]; }
+  function setupCanvas(c){
+    var dpr=window.devicePixelRatio||1, w=c.clientWidth, h=c.clientWidth*(c.height/c.width);
+    if(!c._ratio) c._ratio=c.height/c.width;
+    h=w*c._ratio;
+    c.width=Math.round(w*dpr); c.height=Math.round(h*dpr); c.style.height=h+"px";
+    var ctx=c.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0); return {ctx:ctx,w:w,h:h};
+  }
+  function arrow(ctx,x0,y0,x1,y1,col,dash,lw){
+    ctx.save(); ctx.strokeStyle=col; ctx.fillStyle=col; ctx.lineWidth=lw||2.5; if(dash) ctx.setLineDash([5,4]);
+    ctx.beginPath(); ctx.moveTo(x0,y0); ctx.lineTo(x1,y1); ctx.stroke(); ctx.setLineDash([]);
+    var a=Math.atan2(y1-y0,x1-x0); ctx.beginPath(); ctx.moveTo(x1,y1);
+    ctx.lineTo(x1-10*Math.cos(a-0.4),y1-10*Math.sin(a-0.4)); ctx.lineTo(x1-10*Math.cos(a+0.4),y1-10*Math.sin(a+0.4)); ctx.closePath(); ctx.fill(); ctx.restore();
+  }
+  function draw1(){
+    var m=+$("m").value, n=+$("n").value, th=+$("th").value*Math.PI/180;
+    $("mv").textContent=m; $("nv").textContent=n; $("thv").textContent=$("th").value+"°";
+    var o=setupCanvas($("cv")), ctx=o.ctx, W=o.w, H=o.h, cx=W/2, cy=H/2, R=Math.min(W,H)*0.38;
+    ctx.clearRect(0,0,W,H);
+    ctx.strokeStyle=css("--grid"); ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(0,cy); ctx.lineTo(W,cy); ctx.moveTo(cx,0); ctx.lineTo(cx,H); ctx.stroke();
+    ctx.beginPath(); ctx.arc(cx,cy,R,0,2*Math.PI); ctx.stroke();
+    var qr=rot(qv,m*th), kr=rot(kv,n*th);
+    var Q=css("--q"), K=css("--k");
+    arrow(ctx,cx,cy,cx+qv[0]*R,cy-qv[1]*R,Q,true,1.5);
+    arrow(ctx,cx,cy,cx+kv[0]*R,cy-kv[1]*R,K,true,1.5);
+    arrow(ctx,cx,cy,cx+qr[0]*R,cy-qr[1]*R,Q,false,3);
+    arrow(ctx,cx,cy,cx+kr[0]*R,cy-kr[1]*R,K,false,3);
+    // angle arc between
+    var aq=Math.atan2(qr[1],qr[0]), ak=Math.atan2(kr[1],kr[0]);
+    ctx.save(); ctx.strokeStyle=css("--good"); ctx.lineWidth=2; ctx.beginPath();
+    var diff=aq-ak; while(diff>Math.PI) diff-=2*Math.PI; while(diff<-Math.PI) diff+=2*Math.PI;
+    ctx.arc(cx,cy,R*0.3,-ak,-(ak+diff),diff>0); ctx.stroke(); ctx.restore();
+    ctx.font="13px sans-serif"; ctx.fillStyle=Q; ctx.fillText("q 旋转 m·θ",cx+qr[0]*R*1.05+4,cy-qr[1]*R*1.05);
+    ctx.fillStyle=K; ctx.fillText("k 旋转 n·θ",cx+kr[0]*R*1.05+4,cy-kr[1]*R*1.05+14);
+    var dp=qr[0]*kr[0]+qr[1]*kr[1];
+    $("read1").innerHTML="相对位置 m − n = <b>"+(m-n)+"</b><br>q 转了 "+(m*+$("th").value)+"°，k 转了 "+(n*+$("th").value)+"°<br>两者夹角差 = (m−n)·θ = "+((m-n)*+$("th").value)+"°<br>点积 q′·k′ = <span class='big'>"+dp.toFixed(4)+"</span>";
+  }
+  ["m","n","th"].forEach(function(id){ $(id).oninput=draw1; });
+  $("shift").onclick=function(){
+    var m=+$("m").value, n=+$("n").value;
+    if(m>=20||n>=20){ $("m").value=m-n>=0? m-n : 0; $("n").value=m-n>=0?0:n-m; } else { $("m").value=m+1; $("n").value=n+1; }
+    draw1();
+  };
+  var animT=null;
+  $("anim").onclick=function(){
+    var b=this;
+    if(animT){ clearInterval(animT); animT=null; b.textContent="连续平移动画"; return; }
+    b.textContent="停止";
+    animT=setInterval(function(){ $("shift").onclick(); },600);
+  };
+
+  // panel 2
+  var D=8, base=10000, thetas=[];
+  for(var i=0;i<D/2;i++) thetas.push(Math.pow(base,-2*i/D));
+  var dialBox=$("dials");
+  thetas.forEach(function(t,i){
+    var d=document.createElement("div"); d.className="dial";
+    d.innerHTML="<canvas width='120' height='120'></canvas><div>第 "+(i+1)+" 对（维度 "+(2*i)+","+(2*i+1)+"）<br>θ = "+(t>=0.01?t.toFixed(3):t.toExponential(0))+" rad/位</div><div class='ang'></div>";
+    dialBox.appendChild(d);
+  });
+  function draw2(){
+    var p=+$("pos").value; $("posv").textContent=p;
+    var cvs=dialBox.querySelectorAll("canvas"), angs=dialBox.querySelectorAll(".ang");
+    for(var i=0;i<cvs.length;i++){
+      var o=setupCanvas(cvs[i]), ctx=o.ctx, W=o.w, H=o.h, cx=W/2, cy=H/2, R=W*0.4;
+      ctx.clearRect(0,0,W,H);
+      ctx.strokeStyle=css("--grid"); ctx.lineWidth=1; ctx.beginPath(); ctx.arc(cx,cy,R,0,2*Math.PI); ctx.stroke();
+      for(var k=0;k<12;k++){ var a=k*Math.PI/6; ctx.beginPath(); ctx.moveTo(cx+R*0.88*Math.cos(a),cy+R*0.88*Math.sin(a)); ctx.lineTo(cx+R*Math.cos(a),cy+R*Math.sin(a)); ctx.stroke(); }
+      var ang=p*thetas[i];
+      arrow(ctx,cx,cy,cx+R*0.9*Math.cos(ang),cy-R*0.9*Math.sin(ang),css("--q"),false,2.5);
+      var deg=(ang*180/Math.PI)%360;
+      angs[i].textContent="累计 "+(ang*180/Math.PI).toFixed(1)+"°（"+(ang/(2*Math.PI)).toFixed(2)+" 圈）";
+    }
+  }
+  $("pos").oninput=draw2;
+  var t2=null;
+  $("play2").onclick=function(){
+    var b=this;
+    if(t2){ clearInterval(t2); t2=null; b.textContent="播放"; return; }
+    b.textContent="暂停";
+    t2=setInterval(function(){ var p=+$("pos").value+1; if(p>400) p=0; $("pos").value=p; draw2(); },60);
+  };
+  function draw3(){
+    var o=setupCanvas($("cv2")), ctx=o.ctx, W=o.w, H=o.h;
+    ctx.clearRect(0,0,W,H);
+    var d=64, th=[]; for(var i=0;i<d/2;i++) th.push(Math.pow(base,-2*i/d));
+    var N=300, ys=[];
+    for(var r=0;r<=N;r++){ var s=0; for(i=0;i<d/2;i++) s+=2*Math.cos(r*th[i]); ys.push(s/d); }
+    var L=36, B=22, T=10, Rr=8;
+    ctx.strokeStyle=css("--grid"); ctx.lineWidth=1; ctx.font="11px sans-serif"; ctx.fillStyle=css("--muted");
+    var y0=function(v){ return T+(1-(v+0.2)/1.2)*(H-T-B); };
+    [-0.2,0,0.5,1].forEach(function(v){ ctx.beginPath(); ctx.moveTo(L,y0(v)); ctx.lineTo(W-Rr,y0(v)); ctx.stroke(); ctx.fillText(v.toFixed(1),4,y0(v)+4); });
+    for(var x=0;x<=N;x+=50){ var px=L+x/N*(W-L-Rr); ctx.fillText(String(x),px-6,H-6); }
+    ctx.fillText("相对距离 m−n →",W-110,H-6);
+    ctx.strokeStyle=css("--k"); ctx.lineWidth=1.8; ctx.beginPath();
+    ys.forEach(function(v,i){ var px=L+i/N*(W-L-Rr), py=y0(v); if(i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py); });
+    ctx.stroke();
+  }
+  $("t1").onclick=function(){ $("p1").style.display=""; $("p2").style.display="none"; this.className="on"; $("t2").className=""; draw1(); };
+  $("t2").onclick=function(){ $("p2").style.display=""; $("p1").style.display="none"; this.className="on"; $("t1").className=""; draw2(); draw3(); };
+  window.addEventListener("resize",function(){ draw1(); if($("p2").style.display!=="none"){draw2();draw3();} });
+  draw1();
+})();
+</script>
+</body>
+</html>

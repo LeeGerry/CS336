@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>图像切 patch 变 token</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#656d76;--card:#f6f8fa;--border:#d0d7de;--accent:#2563eb;--good:#16a34a;--bad:#dc2626;--warn:#d97706;--off:#e5e7eb}
+@media (prefers-color-scheme: dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8b949e;--card:#161b22;--border:#30363d;--accent:#58a6ff;--good:#4ade80;--bad:#f87171;--warn:#f59e0b;--off:#21262d}}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+h3{margin:0 0 6px;font-size:16px}
+.ctrl{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:6px 12px;margin-bottom:8px;font-size:13px}
+.ctrl label{display:flex;align-items:center;gap:6px}
+select{font:inherit;padding:3px 6px;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--fg);flex:1;min-width:0}
+input[type=range]{flex:1;min-width:60px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px}
+.main{display:flex;flex-wrap:wrap;gap:10px}
+.main .left{flex:2 1 300px;min-width:0}
+.main .right{flex:1 1 180px;min-width:0}
+#view{max-width:100%;max-height:460px;width:auto;margin:0 auto;display:block;border-radius:4px;cursor:crosshair;background:#888}
+#seen{width:100%;max-width:220px;display:block;image-rendering:pixelated;border:1px solid var(--border);border-radius:4px}
+#zoom{width:140px;height:140px;image-rendering:pixelated;border:1px solid var(--border);border-radius:4px;display:block}
+.big{font-size:22px;font-weight:700;color:var(--accent)}
+.formula{font-size:13px;font-variant-numeric:tabular-nums}
+.strip{display:flex;flex-wrap:wrap;gap:2px;align-items:center}
+.strip canvas{width:22px;height:22px;image-rendering:pixelated;border:1px solid var(--border)}
+.t{font-size:12px;padding:1px 5px;border-radius:4px;background:var(--off);border:1px solid var(--border)}
+.t.sp{background:var(--warn);color:#fff;border-color:var(--warn)}
+.note{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<h3>图像如何变成 Transformer 能吃的 token？</h3>
+<div class="ctrl">
+  <label>图片 <select id="img">
+    <option value="sq">方形照片 672×672</option>
+    <option value="wide">横幅图 1344×672</option>
+    <option value="doc" selected>竖版文档 672×1008</option>
+    <option value="eq">小公式截图 252×84</option>
+  </select></label>
+  <label>处理方式 <select id="mode">
+    <option value="vit">ViT 直接切原图</option>
+    <option value="clip" selected>CLIP：缩放 + 中心裁剪 336</option>
+    <option value="anyres">AnyRes（LLaVA）：切块 + 全局图</option>
+    <option value="qwen">动态分辨率（Qwen2-VL）：2×2 合并</option>
+  </select></label>
+  <label>patch 边长 P（前两种方式） <input type="range" id="P" min="8" max="32" step="2" value="14"><b id="Pv">14</b></label>
+</div>
+<div class="main">
+  <div class="left card">
+    <canvas id="view" width="600" height="600"></canvas>
+    <div class="note" id="vnote">点击图上的任意格子，查看这个 patch 变成 token 的过程。</div>
+  </div>
+  <div class="right">
+    <div class="card">
+      <div class="note">送进语言模型的图像 token 数</div>
+      <div class="big" id="cnt">0</div>
+      <div class="formula" id="formula"></div>
+    </div>
+    <div class="card">
+      <div class="note" id="seenTitle">模型实际看到的输入</div>
+      <canvas id="seen" width="336" height="336"></canvas>
+    </div>
+  </div>
+</div>
+<div class="card">
+  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+    <canvas id="zoom" width="14" height="14"></canvas>
+    <div style="flex:1;min-width:180px;font-size:13px" id="pinfo">选中的 patch 会显示在左侧（放大后的像素）。</div>
+  </div>
+</div>
+<div class="card">
+  <div class="note" style="margin-bottom:4px">最终送进语言模型的序列（图像 token 与文字 token 拼在一起；只画出前若干个图像 token）：</div>
+  <div class="strip" id="strip"></div>
+</div>
+<script>
+(function(){
+function $(i){return document.getElementById(i);}
+var DIMS={sq:[672,672],wide:[1344,672],doc:[672,1008],eq:[252,84]};
+var src=document.createElement('canvas'),sctx=src.getContext('2d');
+var regions=[],sel=null,seenSrc=null;
+function scene(){
+  var d=DIMS[$('img').value],W=d[0],H=d[1];src.width=W;src.height=H;var c=sctx;
+  if($('img').value==='eq'){c.fillStyle='#fff';c.fillRect(0,0,W,H);c.fillStyle='#111';c.font='italic 40px serif';c.fillText('E = mc²',40,56);c.font='14px serif';c.fillText('(1)',210,56);return;}
+  var g=c.createLinearGradient(0,0,0,H);g.addColorStop(0,'#7cc4f5');g.addColorStop(1,'#e8f4fb');c.fillStyle=g;c.fillRect(0,0,W,H);
+  c.fillStyle='#ffd34d';c.beginPath();c.arc(W*0.82,H*0.14,Math.min(W,H)*0.08,0,7);c.fill();
+  c.fillStyle='#6bbf59';c.fillRect(0,H*0.78,W,H*0.22);
+  var hx=W*0.06,hy=H*0.5,hw=Math.min(W,H)*0.32,hh=hw*0.75;
+  c.fillStyle='#c0504d';c.beginPath();c.moveTo(hx-10,hy);c.lineTo(hx+hw/2,hy-hw*0.45);c.lineTo(hx+hw+10,hy);c.fill();
+  c.fillStyle='#f2e3c6';c.fillRect(hx,hy,hw,hh);c.fillStyle='#6b4226';c.fillRect(hx+hw*0.4,hy+hh*0.45,hw*0.22,hh*0.55);
+  c.fillStyle='#5aa0d8';c.fillRect(hx+hw*0.1,hy+hh*0.2,hw*0.2,hw*0.2);c.fillRect(hx+hw*0.7,hy+hh*0.2,hw*0.2,hw*0.2);
+  // 一张贴在画面右下的“文档”，用来体现 OCR 需要的细节
+  var dw=Math.min(W*0.42,300),dh=$('img').value==='doc'?H*0.62:H*0.5,dx=W-dw-W*0.05,dy=$('img').value==='doc'?H*0.3:H*0.3;
+  c.fillStyle='#fff';c.fillRect(dx,dy,dw,dh);c.strokeStyle='#999';c.strokeRect(dx,dy,dw,dh);
+  c.fillStyle='#111';c.font='bold 18px sans-serif';c.fillText('CS336 第 17 章',dx+12,dy+28);
+  c.font='11px sans-serif';
+  var lines=['ViT 把图片切成 14×14 的 patch','每个 patch 是一个 token','336÷14 = 24，24×24 = 576','AnyRes：切块 + 全局缩略图','Qwen2-VL：每 2×2 合并','M-RoPE：(t, h, w) 三维位置','OCR 需要高分辨率！','小字号：j 和 i 别看错','SigLIP：sigmoid 二分类','Chameleon：VQ-VAE 离散码'];
+  for(var i=0;i*16+50<dh-8&&i<lines.length*3;i++)c.fillText(lines[i%lines.length],dx+12,dy+50+i*16);
+}
+function P(){return +$('P').value;}
+function compute(){
+  var d=DIMS[$('img').value],W=d[0],H=d[1],m=$('mode').value,p=P();regions=[];
+  var f='',count=0,seen=document.createElement('canvas');
+  if(m==='vit'){
+    var c1=Math.floor(W/p),r1=Math.floor(H/p);
+    regions.push({x:0,y:0,w:c1*p,h:r1*p,cols:c1,rows:r1,cell:p,label:''});
+    count=c1*r1;f='⌊'+W+'/'+p+'⌋ × ⌊'+H+'/'+p+'⌋ = '+c1+' × '+r1+' = <b>'+count+'</b><br>不缩放，直接在原图上切：高分辨率图会产生大量 token，而且训练时每张图尺寸不同。';
+    seen.width=W;seen.height=H;seen.getContext('2d').drawImage(src,0,0);
+  }else if(m==='clip'){
+    var s=336/Math.min(W,H),side=336/s,x0=(W-side)/2,y0=(H-side)/2,n=Math.floor(336/p);
+    regions.push({x:x0,y:y0,w:n*p/s,h:n*p/s,cols:n,rows:n,cell:p/s,crop:true,scale:s});
+    count=n*n;
+    var lost=1-side*side/(W*H);
+    f='短边缩放到 336（缩放比 '+s.toFixed(3)+'），中心裁剪 336×336<br>⌊336/'+p+'⌋² = '+n+'² = <b>'+count+'</b><br><span style="color:var(--bad)">被裁掉的原图面积：'+(lost*100).toFixed(0)+'%</span>；保留部分的细节也被缩小了。';
+    seen.width=336;seen.height=336;seen.getContext('2d').drawImage(src,x0,y0,side,side,0,0,336,336);
+  }else if(m==='anyres'){
+    var a=Math.min(3,Math.max(1,Math.round(W/336))),b=Math.min(3,Math.max(1,Math.round(H/336)));
+    var tw=W/a,thh=H/b;
+    regions.push({x:0,y:0,w:W,h:H,cols:24,rows:24,cell:Math.max(W,H)/24,global:true,gw:W,gh:H});
+    for(var j=0;j<b;j++)for(var i=0;i<a;i++)regions.push({x:i*tw,y:j*thh,w:tw,h:thh,cols:24,rows:24,cellW:tw/24,cellH:thh/24,tile:true});
+    count=(a*b+1)*576;
+    f='切成 '+a+' × '+b+' = '+(a*b)+' 块（每块缩放到 336×336）+ 1 个全局缩略图<br>('+(a*b)+' + 1) × 576 = <b>'+count+'</b><br>块数过多时（如视频或超高分辨率）用双线性插值减少 token。';
+    seen.width=336*a;seen.height=336*b;seen.getContext('2d').drawImage(src,0,0,W,H,0,0,336*a,336*b);
+  }else{
+    var Wq=Math.max(28,Math.round(W/28)*28),Hq=Math.max(28,Math.round(H/28)*28),cc=Wq/28,rr=Hq/28,sx=W/Wq,sy=H/Hq;
+    regions.push({x:0,y:0,w:W,h:H,cols:cc,rows:rr,cellW:28*sx,cellH:28*sy,sub:true});
+    count=cc*rr+2;
+    f='宽高取整到 28 的倍数：'+Wq+' × '+Hq+'<br>每 14×14 一个 patch，2×2 合并成 1 个 token：('+Wq+'/28) × ('+Hq+'/28) + 2 = '+cc+' × '+rr+' + 2 = <b>'+count+'</b><br>（+2 是图像开始/结束特殊 token；Qwen 标准的 224×224 → 66 个）';
+    seen.width=Wq;seen.height=Hq;seen.getContext('2d').drawImage(src,0,0,W,H,0,0,Wq,Hq);
+  }
+  seenSrc=seen;
+  $('cnt').textContent=count.toLocaleString();$('formula').innerHTML=f;
+  $('seenTitle').textContent={vit:'模型看到的：原图（'+W+'×'+H+'）',clip:'模型看到的：336×336（注意文字变糊、两侧丢失）',anyres:'模型看到的：每块 336 的拼图 + 一张缩略全图',qwen:'模型看到的：保持宽高比的原分辨率'}[m];
+  return count;
+}
+function render(){
+  scene();var count=compute();
+  var v=$('view'),W=src.width,H=src.height,dispW=600,sc=dispW/Math.max(W,H*1.0)*Math.min(1,1);
+  sc=Math.min(600/W,600/H);v.width=Math.round(W*sc);v.height=Math.round(H*sc);
+  var c=v.getContext('2d');c.drawImage(src,0,0,v.width,v.height);
+  var m=$('mode').value;$('P').disabled=(m==='anyres'||m==='qwen');
+  regions.forEach(function(r,ri){
+    c.save();
+    if(r.crop){c.fillStyle='rgba(0,0,0,0.55)';c.fillRect(0,0,v.width,v.height);c.drawImage(src,r.x,r.y,r.w,r.h,r.x*sc,r.y*sc,r.w*sc,r.h*sc);}
+    var cw=(r.cellW||r.cell)*sc,ch=(r.cellH||r.cell)*sc;
+    if(r.global){c.restore();return;}
+    c.strokeStyle=r.tile?'rgba(37,99,235,0.35)':'rgba(255,255,255,0.75)';c.lineWidth=1;
+    if(cw>=3){c.beginPath();for(var i=0;i<=r.cols;i++){c.moveTo(r.x*sc+i*cw,r.y*sc);c.lineTo(r.x*sc+i*cw,r.y*sc+r.rows*ch);}for(var j=0;j<=r.rows;j++){c.moveTo(r.x*sc,r.y*sc+j*ch);c.lineTo(r.x*sc+r.cols*cw,r.y*sc+j*ch);}c.stroke();}
+    if(r.sub&&cw>=8){c.strokeStyle='rgba(255,255,255,0.3)';c.setLineDash([2,2]);c.beginPath();for(var i2=0;i2<r.cols;i2++){c.moveTo(r.x*sc+(i2+0.5)*cw,0);c.lineTo(r.x*sc+(i2+0.5)*cw,r.rows*ch);}for(var j2=0;j2<r.rows;j2++){c.moveTo(0,(j2+0.5)*ch);c.lineTo(r.cols*cw,(j2+0.5)*ch);}c.stroke();c.setLineDash([]);}
+    if(r.tile||r.crop){c.strokeStyle='#d97706';c.lineWidth=3;c.strokeRect(r.x*sc,r.y*sc,r.w*sc,r.h*sc);}
+    c.restore();
+  });
+  if(sel){c.strokeStyle='#dc2626';c.lineWidth=3;c.strokeRect(sel.x*sc,sel.y*sc,sel.w*sc,sel.h*sc);}
+  var se=$('seen');se.width=seenSrc.width;se.height=seenSrc.height;se.getContext('2d').drawImage(seenSrc,0,0);
+  $('vnote').textContent=m==='anyres'?'橙框 = 各个切块（每块独立编码成 24×24 = 576 个 token），另有一张整图缩略图也编码成 576 个 token。点击查看 patch。':(m==='qwen'?'实线格 = 合并后的 1 个 token（28×28 像素），虚线 = 合并前的 4 个 14×14 patch。点击查看。':'点击图上的任意格子，查看这个 patch 变成 token 的过程。');
+  strip(count);
+}
+function cellAt(px,py){
+  for(var k=regions.length-1;k>=0;k--){var r=regions[k];if(r.global)continue;var cw=r.cellW||r.cell,ch=r.cellH||r.cell;
+    if(px>=r.x&&py>=r.y&&px<r.x+r.cols*cw&&py<r.y+r.rows*ch){var i=Math.floor((px-r.x)/cw),j=Math.floor((py-r.y)/ch);return {x:r.x+i*cw,y:r.y+j*ch,w:cw,h:ch,i:i,j:j,r:r,k:k};}}
+  return null;
+}
+$('view').addEventListener('click',function(e){
+  var v=$('view'),rect=v.getBoundingClientRect(),sc=v.width/src.width;
+  var px=(e.clientX-rect.left)*(v.width/rect.width)/sc,py=(e.clientY-rect.top)*(v.height/rect.height)/sc;
+  var c=cellAt(px,py);if(!c)return;sel=c;render();showPatch(c);
+});
+function showPatch(c){
+  var m=$('mode').value,p=m==='qwen'?28:(m==='anyres'?14:P());
+  var z=$('zoom');z.width=p;z.height=p;var zc=z.getContext('2d');zc.imageSmoothingEnabled=true;zc.drawImage(src,c.x,c.y,c.w,c.h,0,0,p,p);
+  if(m==='qwen'){zc.strokeStyle='rgba(255,0,0,0.6)';zc.lineWidth=0.5;zc.beginPath();zc.moveTo(14,0);zc.lineTo(14,28);zc.moveTo(0,14);zc.lineTo(28,14);zc.stroke();}
+  var idx=c.j*c.r.cols+c.i;
+  var h='位置：第 '+(c.j+1)+' 行、第 '+(c.i+1)+' 列（行优先编号 #'+idx+'）。<br>';
+  if(m==='qwen')h+='这是 2×2 = 4 个 14×14 patch。每个展平为 14×14×3 = 588 个数，ViT 编码后把 4 个向量拼接（4×d 维），再用 MLP 压成 1 个语言模型维度的 token。位置用 M-RoPE 的 (t, h, w) = (0, '+c.j+', '+c.i+') 表示。';
+  else h+='像素块 '+p+'×'+p+'×3（RGB）展平成 <b>'+(p*p*3)+'</b> 个数 → 线性层 → 一个 d 维向量（ViT-L 中 d = 1024），加上位置嵌入 #'+idx+' 后送进 Transformer。'+(m==='clip'?'<br>注意：它取自缩放后的图，原图中对应 '+(c.w).toFixed(1)+' 像素见方的区域。':'');
+  $('pinfo').innerHTML=h;
+}
+function strip(count){
+  var s=$('strip');s.innerHTML='';
+  function tok(t,sp){var e=document.createElement('span');e.className='t'+(sp?' sp':'');e.textContent=t;s.appendChild(e);}
+  tok('<|user|>',true);tok('<img>',true);
+  var shown=0,max=40;
+  for(var k=0;k<regions.length&&shown<max;k++){var r=regions[k],cw=r.cellW||r.cell,ch=r.cellH||r.cell;
+    if(r.global){cw=r.gw/24;ch=r.gh/24;}
+    for(var j=0;j<r.rows&&shown<max;j++)for(var i=0;i<r.cols&&shown<max;i++){
+      var cv=document.createElement('canvas');cv.width=8;cv.height=8;
+      cv.getContext('2d').drawImage(src,r.x+i*cw,r.y+j*ch,cw,ch,0,0,8,8);s.appendChild(cv);shown++;}
+  }
+  if(count>shown){var e=document.createElement('span');e.className='note';e.textContent=' … 还有 '+(count-shown).toLocaleString()+' 个 ';s.appendChild(e);}
+  tok('</img>',true);['这','张','图','里','写','了','什么','？'].forEach(function(t){tok(t,false);});tok('<|assistant|>',true);
+}
+['img','mode'].forEach(function(id){$(id).onchange=function(){sel=null;$('pinfo').textContent='选中的 patch 会显示在左侧（放大后的像素）。';render();};});
+$('P').oninput=function(){$('Pv').textContent=P();sel=null;render();};
+render();
+})();
+</script>
+</body>
+</html>

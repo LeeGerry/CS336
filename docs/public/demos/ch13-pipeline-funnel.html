@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>预训练数据漏斗</title>
+<style>
+:root{
+  --bg:#ffffff; --fg:#1f2328; --muted:#656d76; --card:#f6f8fa; --border:#d0d7de;
+  --accent:#3b6fd8; --ok:#2e7d32; --bad:#d1495b; --warn:#b26a00; --grid:#e6e9ed; --code:#eef1f5;
+  --s0:#6b7bd6; --s1:#5b8fd9; --s2:#4aa3c9; --s3:#3fae9b; --s4:#55ae68; --s5:#8aa944; --s6:#b59a35;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#16181d; --fg:#e6e8eb; --muted:#9aa4b2; --card:#20242b; --border:#363c46;
+    --accent:#7aa2ff; --ok:#6fd17a; --bad:#ff7a85; --warn:#f0b357; --grid:#2a2f37; --code:#111317;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+h1{font-size:16px;margin:0 0 8px}
+h2{font-size:14px;margin:12px 0 6px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin:6px 0}
+label{color:var(--muted)}
+button{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 8px;cursor:pointer}
+button.on{border-color:var(--accent);color:var(--accent);font-weight:600}
+input[type=range]{width:100%}
+.small{font-size:12px;color:var(--muted)}
+.ctrl{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px}
+.stage{display:grid;grid-template-columns:118px 1fr 44px;gap:6px;align-items:center;margin:3px 0;cursor:pointer;border-radius:6px;padding:2px 4px}
+.stage:hover{background:var(--grid)}
+.stage.sel{outline:2px solid var(--accent)}
+.stage .nm{font-size:13px;font-weight:600}
+.funnel{height:22px;display:flex;justify-content:center}
+.funnel div{height:100%;border-radius:4px;transition:width .5s ease}
+.stage .ct{text-align:right;font-weight:700;font-variant-numeric:tabular-nums}
+.stage.future{opacity:.3}
+.doc{display:flex;gap:6px;align-items:flex-start;padding:4px 0;border-bottom:1px solid var(--border);font-size:13px;cursor:pointer}
+.doc:hover{background:var(--grid)}
+.doc .u{color:var(--muted);font-size:12px;word-break:break-all}
+.tag{display:inline-block;padding:0 6px;border-radius:999px;font-size:11px;font-weight:700;color:#fff;white-space:nowrap}
+.tag.ok{background:var(--ok)} .tag.bad{background:var(--bad)}
+pre{white-space:pre-wrap;word-break:break-word;background:var(--code);border:1px solid var(--border);border-radius:6px;padding:6px;font-size:12px;max-height:180px;overflow:auto;margin:4px 0}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px}
+.trail span{font-size:12px;margin-right:6px}
+</style>
+</head>
+<body>
+<h1>从“爬到的网页”到“训练数据”：每一步还剩多少？</h1>
+<div class="small">下面是 23 个玩具网页，每一步规则都真的在浏览器里运行。点“播放”看漏斗逐级收缩；点某一级看它丢掉了谁、为什么；点某篇文档看原始 HTML 与抽取文本。</div>
+
+<div class="card small" id="scale"><b>真实规模（来自课上）：</b>Common Crawl 每月一次抓取约 30~50 亿页（2026 年 4 月那次 21.9 亿页、372 TB）；DCLM 把 Common Crawl 处理成 240T token 的 DCLM-pool，再经规则、去重、质量分类器只留下约 1~2%（DCLM-baseline 约 3.8T token）。</div>
+
+<div class="row">
+  <button id="play">▶ 播放</button>
+  <button id="all">直接看全部</button>
+  <span class="small" id="stepInfo"></span>
+</div>
+
+<div class="card" id="funnel"></div>
+
+<div class="card ctrl">
+  <div><label>HTML→文本方式：</label>
+    <div class="row" style="margin:2px 0"><button id="exWet">WET 式（去标签，保留导航/页脚）</button><button id="exMain" class="on">正文抽取（去导航/页脚）</button></div></div>
+  <div><label>语言识别阈值 p(en) ≥ <b id="lV"></b></label><input id="lang" type="range" min="0.3" max="0.95" step="0.05" value="0.65"></div>
+  <div><label><input type="checkbox" id="brace" checked> 启用 C4 的“含 { 就整页删除”规则</label><br><label><input type="checkbox" id="gopher" checked> 启用 Gopher 规则</label></div>
+  <div><label>近似去重阈值（3-gram Jaccard ≥）<b id="dV"></b></label><input id="dup" type="range" min="0.3" max="0.95" step="0.05" value="0.5"></div>
+  <div><label>质量分类器阈值 ≥ <b id="qV"></b></label><input id="qual" type="range" min="0" max="0.95" step="0.05" value="0.5"></div>
+</div>
+
+<div class="cols">
+  <div class="card"><b id="detTitle">各级详情</b><div id="detail" class="small">点击上面漏斗里的某一级。</div></div>
+  <div class="card"><b>文档查看器</b><div id="viewer" class="small">点击列表里的某篇文档。</div></div>
+</div>
+
+<script>
+(function(){
+const NAV = '<header><nav>Home | News | Sports | About | Contact | Login</nav></header>';
+const FOOT = '<footer><p>Copyright 2025 Example Media. All rights reserved. Privacy Policy | Terms of Use | Cookie Settings</p></footer>';
+const BEE = '<h1>Honey bees</h1><p>Honey bees are social insects that live in large colonies with a single queen, thousands of female workers and a few hundred male drones.</p><p>Workers collect nectar and pollen from flowers, and they communicate the location of food to their sisters with a waggle dance.</p>';
+const DOCS = [
+  {u:'en.example-wiki.org/Honey_bee', q:0.92, h: NAV + BEE + FOOT},
+  {u:'mirror.bees-archive.net/Honey_bee', q:0.92, h: NAV + BEE + FOOT},
+  {u:'en.example-wiki.org/Honey_bee?utm_source=feed', q:0.9, h: NAV + BEE.replace('a few hundred male drones.', 'a few hundred male drones, which do not sting.') + '<p>See also: bumblebee.</p>' + FOOT},
+  {u:'news.example.cn/2025/tech', q:0.8, h: NAV + '<h1>人工智能新进展</h1><p>研究人员发布了一个新的开源语言模型，它在多项数学与编程基准测试上取得了很好的成绩，并公开了全部训练数据与代码。</p>' + FOOT},
+  {u:'recetas.example.es/tortilla', q:0.75, h: NAV + '<h1>Tortilla de patatas</h1><p>Pela las patatas y córtalas en rodajas finas. Fríelas en aceite de oliva a fuego lento con la cebolla, luego mezcla con los huevos batidos y cuaja la tortilla por los dos lados.</p>' + FOOT},
+  {u:'social.example.com/in/someone', q:0.5, login:true, h:'<p>Sign in to see the full profile. Join now to view more.</p>'},
+  {u:'bignews.example.com/2025/article', q:0.85, robots:false, h: NAV + '<p>Subscribers only article about the economy.</p>' + FOOT},
+  {u:'app.example.io/dashboard', q:0.5, h:'<html><body><div id="root"></div><script src="/static/bundle.js"><\/script><noscript>You need to enable JavaScript to run this app.</noscript></body></html>'},
+  {u:'cheap-hotels.example.biz/paris', q:0.05, h: NAV + '<h1>Cheap hotels Paris</h1><p>Cheap hotels Paris best cheap hotels Paris book cheap hotels Paris now. Cheap hotels Paris deals, cheap hotels Paris discount, cheap hotels Paris cheap cheap cheap hotels Paris online booking.</p>' + FOOT},
+  {u:'template-site.example.net/', q:0.1, h: NAV + '<h1>Welcome</h1><p>Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation.</p>' + FOOT},
+  {u:'forum.example.org/latest', q:0.2, h: NAV + '<ul><li>Best way to learn guitar as an adult...</li><li>My cat keeps waking me up at night...</li><li>Anyone else think the new update is slow...</li><li>Looking for a good book about history...</li><li>Read more...</li></ul>' + FOOT},
+  {u:'dev.example.com/tutorial/loops', q:0.85, h: NAV + '<h1>How to write a for loop</h1><p>A for loop repeats a block of code a fixed number of times. In this short tutorial we print the numbers from zero to four and explain each part of the loop.</p><pre>for (int i = 0; i &lt; 5; i++) { print(i); }</pre>' + FOOT},
+  {u:'shop.example.com/catalog?page=7', q:0.1, h: NAV + '<table><tr><td>SKU 10293</td><td>$19.99</td><td>4.5/5</td></tr><tr><td>SKU 10294</td><td>$24.99</td><td>3.9/5</td></tr><tr><td>SKU 10295</td><td>$9.49</td><td>4.1/5</td></tr><tr><td>SKU 10296</td><td>$14.00</td><td>4.8/5</td></tr><tr><td>SKU 10297</td><td>$31.50</td><td>4.0/5</td></tr></table>' + FOOT},
+  {u:'tiny.example.me/', q:0.3, h:'<p>Hello world! Coming soon.</p>'},
+  {u:'qa.example-exchange.com/questions/42', q:0.88, h: NAV + '<h1>Why does ice float on water?</h1><p>Question: I learned that solids are usually denser than liquids, so why does ice float?</p><p>Answer: When water freezes, hydrogen bonds hold the molecules in an open hexagonal lattice, so ice is about nine percent less dense than liquid water and therefore floats.</p>' + FOOT},
+  {u:'blog.example.net/my-first-marathon', q:0.6, h: NAV + '<h1>My first marathon</h1><p>Last Sunday I finally ran my first marathon. The first half felt easy, but after kilometer thirty my legs were heavy and I had to walk for a while. I still finished, and I learned to start slower next time.</p>' + FOOT},
+  {u:'acme.example.com/terms', q:0.2, h: NAV + '<h1>Terms of Service</h1><p>By accessing or using the services provided by Acme Corporation you agree to be bound by these terms. If you do not agree to these terms you may not use the services. Acme Corporation may change these terms at any time.</p>' + FOOT},
+  {u:'globex.example.com/terms', q:0.2, h: NAV + '<h1>Terms of Service</h1><p>By accessing or using the services provided by Globex Limited you agree to be bound by these terms. If you do not agree to these terms you may not use the services. Globex Limited may change these terms at any time.</p>' + FOOT},
+  {u:'mathhelp.example.edu/fractions', q:0.9, h: NAV + '<h1>Adding fractions</h1><p>To add two fractions with different denominators, first rewrite them with a common denominator. For example, one half plus one third becomes three sixths plus two sixths, which equals five sixths.</p>' + FOOT},
+  {u:'top10.example.info/best-phones', q:0.3, h: NAV + '<h1>Top 10 best phones you must buy right now</h1><p>Number one will shock you! These amazing phones are the best phones ever and you will not believe how amazing they are. Click the next page to see number two of our amazing list.</p>' + FOOT},
+  {u:'citynews.example.com/2025/bridge', q:0.72, h: NAV + '<h1>New bridge opens downtown</h1><p>The city opened a new pedestrian bridge over the river on Monday. Officials said the bridge will shorten the walk between the train station and the university by about ten minutes.</p>' + FOOT},
+  {u:'restaurant.example.com/menu', q:0.4, h: NAV + '<h1>Menu / Menú</h1><p>Welcome to our family restaurant near the beach. Bienvenidos a nuestro restaurante, la mejor comida de la ciudad con los precios más bajos y el mejor servicio para toda la familia.</p>' + FOOT},
+  {u:'learn.example.org/photosynthesis', q:0.85, h: NAV + '<h1>Photosynthesis</h1><p>Plants use sunlight, water and carbon dioxide to make glucose and release oxygen. This process happens mainly in the leaves, inside small structures called chloroplasts that contain the green pigment chlorophyll.</p>' + FOOT}
+];
+const STOP = new Set('the a an and or of to in on for with is are was were be by that this it as at from which they their there have has had not you your we our can will so than then when what why how do does if into about more most one two first after but also used use'.split(' '));
+const STAGES = ['① 发现的 URL','② 可抓取','③ HTML→文本','④ 语言识别','⑤ 规则过滤','⑥ 去重','⑦ 质量分类器'];
+const COLORS = ['--s0','--s1','--s2','--s3','--s4','--s5','--s6'];
+
+let extractMode = 'main', shown = STAGES.length - 1, selStage = null, selDoc = null, timer = null;
+const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function decode(s){ return s.replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&'); }
+function extract(html){
+  let s = html.replace(/<script[\s\S]*?<\/script>/gi,'').replace(/<style[\s\S]*?<\/style>/gi,'').replace(/<noscript[\s\S]*?<\/noscript>/gi,'');
+  if (extractMode === 'main') s = s.replace(/<(nav|header|footer|aside)[\s\S]*?<\/\1>/gi,'');
+  s = s.replace(/<\/(p|li|h[1-6]|div|tr|pre|nav|header|footer)>/gi,'\n').replace(/<br\s*\/?>/gi,'\n').replace(/<\/td>/gi,' ');
+  s = decode(s.replace(/<[^>]+>/g,''));
+  return s.split('\n').map(l=>l.replace(/\s+/g,' ').trim()).filter(Boolean).join('\n');
+}
+const words = t => t.split(/\s+/).filter(Boolean);
+// rough token count: whitespace words, but each CJK character counts as one
+const nTokens = t => words(t.replace(/[\u4e00-\u9fff]/g,' x ')).length;
+// toy language ID: share of Latin letters among all letters, times
+// how much the common function words look English rather than Spanish
+const ES = new Set('el la los las de del y en con por una un que es para su al lo como mas más'.split(' '));
+function pEn(t){
+  const latin = (t.match(/[A-Za-z]/g)||[]).length;
+  const other = (t.match(/[^\x00-\x7F\u00C0-\u024F\s\d\p{P}\p{S}]/gu)||[]).length;
+  const w = (t.toLowerCase().match(/[a-zà-ÿ]+/g)||[]);
+  const en = w.filter(x=>STOP.has(x)).length, es = w.filter(x=>ES.has(x)).length;
+  const ratio = (latin + other) ? latin / (latin + other) : 0;
+  return Math.max(0, Math.min(0.99, ratio * (en + 1) / (en + es + 1)));
+}
+function gopher(t){
+  const w = words(t);
+  if (w.length < 20) return '词数 ' + w.length + ' < 20（Gopher 原规则是 < 50 词，这里按比例缩小）';
+  if (w.length > 100000) return '词数过多';
+  const mean = w.reduce((a,x)=>a+x.length,0) / w.length;
+  if (mean < 3 || mean > 10) return '平均词长 ' + mean.toFixed(1) + ' 不在 3~10 之间';
+  const lines = t.split('\n'); const ell = lines.filter(l=>/(\.\.\.|…)$/.test(l)).length / lines.length;
+  if (ell > 0.3) return (ell*100).toFixed(0) + '% 的行以省略号结尾（> 30%）';
+  const alpha = w.filter(x=>/[A-Za-zÀ-ɏ]/.test(x)).length / w.length;
+  if (alpha < 0.8) return '只有 ' + (alpha*100).toFixed(0) + '% 的词含字母（< 80%）';
+  return null;
+}
+function c4(t){
+  const lw = t.toLowerCase();
+  if (document.getElementById('brace').checked && t.includes('{')) return 'C4：页面含 “{”（本意是去掉代码，结果把教程也删了）';
+  if (lw.includes('lorem ipsum')) return 'C4：含 “lorem ipsum” 占位文本';
+  return null;
+}
+function shingles(t){ const w = t.toLowerCase().replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(Boolean); const s = new Set(); for (let i=0;i+3<=w.length;i++) s.add(w.slice(i,i+3).join(' ')); return s; }
+function jac(a,b){ let i=0; a.forEach(x=>{ if (b.has(x)) i++; }); const u = a.size + b.size - i; return u ? i/u : 0; }
+
+function run(){
+  const lt = +document.getElementById('lang').value, dt = +document.getElementById('dup').value, qt = +document.getElementById('qual').value;
+  document.getElementById('lV').textContent = lt.toFixed(2);
+  document.getElementById('dV').textContent = dt.toFixed(2);
+  document.getElementById('qV').textContent = qt.toFixed(2);
+  const res = DOCS.map((d,i)=>({i, d, text:'', dropAt:null, why:'', p:null}));
+  // stage 1: crawl politeness / access
+  res.forEach(r=>{ if (r.d.robots === false){ r.dropAt = 1; r.why = 'robots.txt 禁止我们的爬虫'; } else if (r.d.login){ r.dropAt = 1; r.why = '内容在登录墙后（围墙花园）'; } });
+  // stage 2: extraction
+  res.forEach(r=>{ if (r.dropAt) return; r.text = extract(r.d.h); if (nTokens(r.text) < 5){ r.dropAt = 2; r.why = /<script/i.test(r.d.h) ? '抽取后几乎没有正文（前端渲染的 App，需要执行 JS 才有内容）' : '抽取后只剩 ' + nTokens(r.text) + ' 个词，几乎没有正文'; } });
+  // stage 3: language id
+  res.forEach(r=>{ if (r.dropAt) return; r.p = pEn(r.text); if (r.p < lt){ r.dropAt = 3; r.why = 'p(en) = ' + r.p.toFixed(2) + ' < ' + lt.toFixed(2); } });
+  // stage 4: rules
+  res.forEach(r=>{ if (r.dropAt) return; const g = document.getElementById('gopher').checked ? gopher(r.text) : null; const c = c4(r.text); const w = g || c; if (w){ r.dropAt = 4; r.why = (g ? 'Gopher：' : '') + w; } });
+  // stage 5: dedup (brute force here; real pipelines use MinHash+LSH)
+  const alive = res.filter(r=>!r.dropAt); const sh = alive.map(r=>shingles(r.text));
+  for (let a = 0; a < alive.length; a++){
+    if (alive[a].dropAt) continue;
+    for (let b = a+1; b < alive.length; b++){
+      if (alive[b].dropAt) continue;
+      const j = jac(sh[a], sh[b]);
+      if (j >= dt){ alive[b].dropAt = 5; alive[b].why = (j >= 0.999 ? '与 ' : '与 ') + '#' + (alive[a].i+1) + ' ' + alive[a].d.u.split('/')[0] + ' 的 3-gram Jaccard = ' + j.toFixed(2) + (j>=0.999?'（完全重复）':'（近似重复）'); }
+    }
+  }
+  // stage 6: quality classifier
+  res.forEach(r=>{ if (r.dropAt) return; if (r.d.q < qt){ r.dropAt = 6; r.why = '质量分 ' + r.d.q.toFixed(2) + ' < ' + qt.toFixed(2); } });
+  return res;
+}
+
+let R = run();
+function counts(){ return STAGES.map((s,k)=>R.filter(r=>r.dropAt === null || r.dropAt > k).length); }
+function renderFunnel(){
+  const c = counts(), el = document.getElementById('funnel');
+  let h = '';
+  STAGES.forEach((s,k)=>{
+    const vis = k <= shown;
+    const w = vis ? (c[k] / DOCS.length * 100) : 0;
+    h += '<div class="stage' + (selStage===k?' sel':'') + (vis?'':' future') + '" data-k="' + k + '"><span class="nm">' + s + '</span>' +
+      '<div class="funnel"><div style="width:' + w.toFixed(1) + '%;background:var(' + COLORS[k] + ')"></div></div><span class="ct">' + (vis ? c[k] : '?') + '</span></div>';
+  });
+  h += '<div class="small">最终保留 ' + (shown === STAGES.length-1 ? c[c.length-1] + ' / ' + DOCS.length + '（' + (c[c.length-1]/DOCS.length*100).toFixed(0) + '%）' : '…') + '</div>';
+  el.innerHTML = h;
+  el.querySelectorAll('.stage').forEach(n=>n.onclick = ()=>{ const k = +n.dataset.k; if (k > shown) return; selStage = k; renderFunnel(); renderDetail(); });
+  document.getElementById('stepInfo').textContent = shown < STAGES.length-1 ? '当前到：' + STAGES[shown] : '';
+}
+function docRow(r, showWhy){
+  return '<div class="doc" data-i="' + r.i + '"><span>#' + (r.i+1) + '</span><span style="flex:1"><span class="u">' + esc(r.d.u) + '</span>' +
+    (showWhy ? '<br><span style="color:var(--bad)">' + esc(r.why) + '</span>' : '') + '</span></div>';
+}
+function renderDetail(){
+  const el = document.getElementById('detail');
+  if (selStage === null){ el.innerHTML = '点击上面漏斗里的某一级。'; return; }
+  const k = selStage;
+  document.getElementById('detTitle').textContent = STAGES[k];
+  const desc = [
+    '爬虫从种子 URL 出发不断发现链接。这里是它找到的全部页面。',
+    '遵守 robots.txt、绕不过登录墙的页面拿不到。',
+    '把 HTML 变成纯文本。前端渲染的页面在不执行 JS 时几乎是空的。',
+    '只保留目标语言（英文）。这里用的是玩具打分；真实流水线用 fastText 的 lid.176 模型。',
+    '手写启发式规则：太短、符号太多、省略号太多、占位文本、含花括号……',
+    '完全重复与近似重复只留一份（演示用两两比较；真实规模必须用 MinHash + LSH，见第 14 章）。',
+    '用分类器给“像不像好数据”打分（这里的分数是预设的示意值），低于阈值的丢掉。'
+  ][k];
+  const dropped = R.filter(r=>r.dropAt === k), kept = R.filter(r=>r.dropAt === null || r.dropAt > k);
+  let h = '<div class="small">' + desc + '</div>';
+  if (k > 0) h += '<div style="margin-top:6px"><span class="tag bad">这一步丢弃 ' + dropped.length + '</span></div>' + dropped.map(r=>docRow(r, true)).join('');
+  h += '<div style="margin-top:6px"><span class="tag ok">之后还剩 ' + kept.length + '</span></div>' + kept.map(r=>docRow(r, false)).join('');
+  el.innerHTML = h;
+  el.querySelectorAll('.doc').forEach(n=>n.onclick = ()=>{ selDoc = +n.dataset.i; renderViewer(); });
+}
+function renderViewer(){
+  const el = document.getElementById('viewer');
+  if (selDoc === null) return;
+  const r = R[selDoc];
+  let trail = '';
+  STAGES.forEach((s,k)=>{ if (k === 0) return; const pass = r.dropAt === null || r.dropAt > k; const here = r.dropAt === k;
+    trail += '<span style="color:' + (here ? 'var(--bad)' : pass ? 'var(--ok)' : 'var(--muted)') + '">' + (here ? '✗' : pass ? '✓' : '·') + ' ' + s.slice(2) + '</span>'; });
+  const text = r.text || extract(r.d.h);
+  el.innerHTML = '<div><b>#' + (r.i+1) + '</b> <span class="u">' + esc(r.d.u) + '</span></div>' +
+    '<div class="trail" style="margin:4px 0">' + trail + '</div>' +
+    (r.dropAt ? '<div style="color:var(--bad)">被丢弃：' + esc(r.why) + '</div>' : '<div style="color:var(--ok)">进入最终训练集</div>') +
+    '<div class="small" style="margin-top:4px">原始 HTML（WARC 里存的是这个）</div><pre>' + esc(r.d.h) + '</pre>' +
+    '<div class="small">抽取出的文本（' + (extractMode==='main'?'正文抽取':'WET 式') + '）' + (r.p !== null ? '　p(en) = ' + r.p.toFixed(2) : '') + '　质量分 = ' + r.d.q.toFixed(2) + '</div><pre>' + esc(text || '（空）') + '</pre>';
+}
+function refresh(){ R = run(); renderFunnel(); renderDetail(); renderViewer(); }
+
+document.getElementById('play').onclick = ()=>{
+  if (timer) clearInterval(timer);
+  shown = 0; selStage = 0; refresh();
+  timer = setInterval(()=>{ if (shown >= STAGES.length-1){ clearInterval(timer); timer = null; return; } shown++; selStage = shown; renderFunnel(); renderDetail(); }, 1100);
+};
+document.getElementById('all').onclick = ()=>{ if (timer){ clearInterval(timer); timer = null; } shown = STAGES.length-1; refresh(); };
+document.getElementById('exWet').onclick = ()=>{ extractMode = 'wet'; document.getElementById('exWet').classList.add('on'); document.getElementById('exMain').classList.remove('on'); refresh(); };
+document.getElementById('exMain').onclick = ()=>{ extractMode = 'main'; document.getElementById('exMain').classList.add('on'); document.getElementById('exWet').classList.remove('on'); refresh(); };
+['lang','dup','qual','brace','gopher'].forEach(id=>document.getElementById(id).addEventListener('input', refresh));
+selStage = STAGES.length - 1;
+refresh();
+})();
+</script>
+</body>
+</html>

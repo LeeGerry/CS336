@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>einops 可视化</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#6b7280;--card:#f5f7fa;--border:#d8dee4;--accent:#2563eb;--hl:#f59e0b;--bad:#dc2626;--bad-soft:#fee2e2;--cellbg:#ffffff;--l:62%}
+@media (prefers-color-scheme: dark){:root{--bg:#16181d;--fg:#e6e8eb;--muted:#9aa3ae;--card:#1f232a;--border:#363c45;--accent:#60a5fa;--hl:#fbbf24;--bad:#f87171;--bad-soft:#4c1d1d;--cellbg:#16181d;--l:38%}}
+*{box-sizing:border-box}
+select{max-width:100%}
+label{max-width:100%}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+body{padding:12px;overflow-x:hidden}
+h3{margin:0 0 6px;font-size:16px}
+h4{margin:0 0 4px;font-size:13.5px}
+.muted{color:var(--muted);font-size:12.5px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin:8px 0}
+button,select,input{font:inherit;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg)}
+button{cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+input.pat{flex:1 1 220px;min-width:0;width:100%;font-family:ui-monospace,Menlo,monospace;font-size:13px}
+input.sm{width:90px;font-family:ui-monospace,Menlo,monospace;font-size:13px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
+.tensors{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start}
+.tbox{min-width:0}
+.blocks{display:flex;flex-wrap:wrap;gap:8px}
+.block{display:inline-block}
+.block .lab{font-size:11px;color:var(--muted);text-align:center}
+.g{display:inline-grid;gap:2px}
+.c{width:26px;height:24px;display:flex;align-items:center;justify-content:center;font-family:ui-monospace,Menlo,monospace;font-size:11.5px;border-radius:3px;border:1px solid var(--border);background:var(--cellbg);cursor:default;transition:outline .1s}
+.c.on{outline:2.5px solid var(--hl);outline-offset:0;font-weight:700}
+.c.empty{opacity:.25}
+.err{background:var(--bad-soft);color:var(--bad);border:1px solid var(--bad);border-radius:6px;padding:6px 8px;margin:6px 0}
+.arrow{align-self:center;font-size:20px;color:var(--muted)}
+@media (max-width:420px){.c{width:22px;height:21px;font-size:10.5px}}
+</style>
+</head>
+<body>
+<h3>einops：给维度起名字，再“重排 / 归约 / 爱因斯坦求和”</h3>
+<div class="muted">每个格子是一个元素，颜色标记它“原来是谁”。把鼠标放在（或点一下）输出格子上，会高亮它来自输入的哪些元素。</div>
+
+<div class="card">
+  <div class="row" style="margin-top:0"><select id="preset" style="width:100%"></select></div>
+  <div class="row">
+    <select id="mode"><option value="rearrange">rearrange</option><option value="reduce">reduce</option><option value="einsum">einsum</option></select>
+    <select id="red" style="display:none"><option>sum</option><option>mean</option><option>max</option></select>
+    <input id="pat" class="pat">
+  </div>
+  <div class="row">
+    <label>x 形状 <input id="xs" class="sm" value="3,8"></label>
+    <label id="ysl">y 形状 <input id="ys" class="sm" value="4,3"></label>
+    <label id="szl">轴长度 <input id="sz" class="sm" value="heads=2"></label>
+  </div>
+  <div class="row">
+    <button id="fill" class="primary">逐个填充输出</button>
+    <button id="chain">把输出当作新的 x</button>
+  </div>
+  <div class="mono muted" id="code"></div>
+</div>
+<div id="err" class="err" style="display:none"></div>
+<div class="tensors" id="view"></div>
+<div class="card mono" id="info">悬停/点击输出格子查看来源。</div>
+
+<script>
+(function(){
+  var $=function(id){return document.getElementById(id);};
+  var PRESETS=[
+    {n:'拆分最后一维：(heads hidden1) → heads hidden1',m:'rearrange',p:'seq (heads hidden1) -> seq heads hidden1',xs:'3,8',sz:'heads=2',code:'x.view(3, 2, 4)'},
+    {n:'合并回去：heads hidden1 → (heads hidden1)',m:'rearrange',p:'seq heads hidden1 -> seq (heads hidden1)',xs:'3,2,4',sz:'',code:'x.reshape(3, 8)'},
+    {n:'把 heads 挪到最前（注意力里常见）',m:'rearrange',p:'seq (heads hidden1) -> heads seq hidden1',xs:'3,8',sz:'heads=2',code:'x.view(3, 2, 4).transpose(0, 1)'},
+    {n:'合并顺序很重要：(hidden1 heads)',m:'rearrange',p:'seq (heads hidden1) -> seq (hidden1 heads)',xs:'3,8',sz:'heads=2',code:'x.view(3, 2, 4).transpose(1, 2).reshape(3, 8)'},
+    {n:'转置：a b → b a',m:'rearrange',p:'a b -> b a',xs:'3,4',sz:'',code:'x.T  # 或 x.transpose(0, 1)'},
+    {n:'reduce：对 hidden 求和',m:'reduce',r:'sum',p:'batch seq hidden -> batch seq',xs:'2,3,4',sz:'',code:'x.sum(dim=-1)'},
+    {n:'reduce：用 ... 代表任意前导维度',m:'reduce',r:'max',p:'... hidden -> ...',xs:'2,3,4',sz:'',code:'x.max(dim=-1).values'},
+    {n:'einsum：矩阵乘法',m:'einsum',p:'seq1 hidden, hidden seq2 -> seq1 seq2',xs:'3,4',ys:'4,3',sz:'',code:'x @ y'},
+    {n:'einsum：批量 x·yᵀ（注意力分数）',m:'einsum',p:'batch seq1 hidden, batch seq2 hidden -> batch seq1 seq2',xs:'2,3,4',ys:'2,3,4',sz:'',code:'x @ y.transpose(-2, -1)'},
+    {n:'einsum：逐行点积',m:'einsum',p:'seq hidden, seq hidden -> seq',xs:'3,4',ys:'3,4',sz:'',code:'(x * y).sum(dim=-1)'}
+  ];
+  PRESETS.forEach(function(p,i){var o=document.createElement('option');o.value=i;o.textContent=(i+1)+'. '+p.n;$('preset').appendChild(o);});
+  var X=null, Y=null, OUT=null, timer=null, fillPos=-1, curCode='';
+
+  function prod(a){return a.reduce(function(x,y){return x*y;},1);}
+  function parseShape(s){ var a=s.split(/[,\s×x]+/).filter(Boolean).map(Number); if(!a.length||a.some(function(v){return !(v>=1&&v<=12&&Math.floor(v)===v);})) throw '形状要写成逗号分隔的正整数（每维 1~12），例如 3,8'; if(prod(a)>200) throw '元素太多（>200），换个小一点的形状'; return a; }
+  function hue(i,n){return Math.round(i/Math.max(1,n)*320);}
+  function mkTensor(shape,valFn){ var n=prod(shape), v=[], c=[]; for(var i=0;i<n;i++){v.push(valFn(i)); c.push(hue(i,n));} return {shape:shape,v:v,c:c}; }
+  function unravel(i,shape){ var r=new Array(shape.length); for(var k=shape.length-1;k>=0;k--){ r[k]=i%shape[k]; i=Math.floor(i/shape[k]); } return r; }
+  function ravel(idx,shape){ var i=0; for(var k=0;k<shape.length;k++) i=i*shape[k]+idx[k]; return i; }
+  function parseSide(s){
+    var toks=s.match(/\(|\)|\.\.\.|[A-Za-z_][A-Za-z0-9_]*|\S/g)||[], groups=[], cur=null;
+    toks.forEach(function(t){
+      if(t==='('){ if(cur) throw '不支持嵌套括号'; cur=[]; }
+      else if(t===')'){ if(!cur) throw '括号不匹配'; groups.push(cur); cur=null; }
+      else if(t==='...'){ if(cur) throw '本演示不支持括号里的 ...'; groups.push('...'); }
+      else if(/^[A-Za-z_]/.test(t)){ if(cur) cur.push(t); else groups.push([t]); }
+      else throw '无法识别的符号：'+t;
+    });
+    if(cur) throw '括号没有闭合'; return groups;
+  }
+  function expandEll(groups,n){ var out=[]; groups.forEach(function(g){ if(g==='...'){ for(var i=0;i<n;i++) out.push(['…'+i]); } else out.push(g); }); return out; }
+  function parseSizes(s){ var m={}; (s||'').split(/[,\s]+/).filter(Boolean).forEach(function(kv){ var p=kv.split('='); if(p.length!==2||!(+p[1]>0)) throw '轴长度写法：heads=2'; m[p[0]]=+p[1]; }); return m; }
+
+  function rearrange(x,pattern,sizes,reduceOp){
+    var sides=pattern.split('->'); if(sides.length!==2) throw '模式里需要一个 ->';
+    var L=parseSide(sides[0]), R=parseSide(sides[1]);
+    var nE=0; if(L.indexOf('...')>=0) nE=x.shape.length-(L.length-1);
+    if(nE<0) throw '左边写的维度比 x 的维度还多';
+    if(R.indexOf('...')>=0 && L.indexOf('...')<0) throw '右边有 ... 但左边没有';
+    L=expandEll(L,nE); R=expandEll(R,nE);
+    if(L.length!==x.shape.length) throw '左边有 '+L.length+' 组维度，但 x 是 '+x.shape.length+' 维（形状 '+x.shape.join('×')+'）';
+    var sz={}; Object.keys(sizes).forEach(function(k){sz[k]=sizes[k];});
+    var elemsL=[];
+    L.forEach(function(g,i){
+      var known=1, unknown=[];
+      g.forEach(function(a){ if(elemsL.indexOf(a)>=0) throw '左边轴名重复：'+a; elemsL.push(a); if(sz[a]) known*=sz[a]; else unknown.push(a); });
+      if(unknown.length>1) throw '分组 ('+g.join(' ')+') 里有多个未知长度，请在“轴长度”里给出，如 '+unknown[0]+'=2';
+      if(unknown.length===1){ if(x.shape[i]%known) throw x.shape[i]+' 不能被 '+known+' 整除'; sz[unknown[0]]=x.shape[i]/known; }
+      else if(known!==x.shape[i]) throw '分组 ('+g.join(' ')+') 的长度乘积 '+known+' ≠ 第 '+i+' 维的 '+x.shape[i];
+    });
+    var elemsR=[]; R.forEach(function(g){ g.forEach(function(a){ if(elemsL.indexOf(a)<0) throw '右边的轴 '+a+' 在左边没出现'; if(elemsR.indexOf(a)>=0) throw '右边轴名重复：'+a; elemsR.push(a); }); });
+    var missing=elemsL.filter(function(a){return elemsR.indexOf(a)<0;});
+    if(missing.length && !reduceOp) throw 'rearrange 不能丢掉轴（'+missing.join(', ')+'）；想求和请用 reduce';
+    if(!missing.length && reduceOp) throw 'reduce 需要右边省略至少一个轴';
+    var oshape=R.map(function(g){return prod(g.map(function(a){return sz[a];}));});
+    var on=prod(oshape), acc=new Array(on), srcs=[]; for(var i=0;i<on;i++){srcs.push([]);}
+    for(var f=0;f<x.v.length;f++){
+      var idx=unravel(f,x.shape), e={};
+      L.forEach(function(g,gi){ var sub=unravel(idx[gi],g.map(function(a){return sz[a];})); g.forEach(function(a,k){e[a]=sub[k];}); });
+      var oidx=R.map(function(g){ return ravel(g.map(function(a){return e[a];}), g.map(function(a){return sz[a];})); });
+      var o=ravel(oidx,oshape); srcs[o].push(f);
+    }
+    var out={shape:oshape,v:[],c:[],srcs:srcs,names:R.map(function(g){return g.length>1?'('+g.join(' ')+')':g[0];})};
+    for(var o2=0;o2<on;o2++){
+      var vs=srcs[o2].map(function(s){return x.v[s];}), val;
+      if(!reduceOp) val=vs[0]; else if(reduceOp==='sum') val=vs.reduce(function(a,b){return a+b;},0); else if(reduceOp==='mean') val=vs.reduce(function(a,b){return a+b;},0)/vs.length; else val=Math.max.apply(null,vs);
+      out.v.push(val); out.c.push(srcs[o2].length===1?x.c[srcs[o2][0]]:null);
+    }
+    out.explain=function(o){ var oi=unravel(o,oshape); var s=srcs[o].map(function(f){return 'x['+unravel(f,x.shape).join(',')+']='+fmt(x.v[f]);});
+      return 'out['+oi.join(',')+'] ← '+(reduceOp?reduceOp+'( '+s.join(', ')+' ) = '+fmt(out.v[o]):s[0]); };
+    out.namesL=L.map(function(g){return g.length>1?'('+g.join(' ')+')':g[0];});
+    return out;
+  }
+  function einsum(x,y,pattern){
+    var sides=pattern.split('->'); if(sides.length!==2) throw '模式里需要一个 ->';
+    var ins=sides[0].split(','); if(ins.length!==2) throw '本演示的 einsum 需要两个输入，用逗号隔开';
+    function names(s,t){ var g=parseSide(s); var nE=g.indexOf('...')>=0?t.shape.length-(g.length-1):0; g=expandEll(g,nE); if(g.some(function(a){return a.length!==1;})) throw 'einsum 里不要用括号'; g=g.map(function(a){return a[0];}); if(g.length!==t.shape.length) throw '模式“'+s.trim()+'”有 '+g.length+' 个轴，但张量是 '+t.shape.length+' 维'; return g; }
+    var ax=names(ins[0],x), ay=names(ins[1],y), outN=parseSide(sides[1]);
+    var nE=Math.max(ax.filter(function(a){return a[0]==='…';}).length, 0); outN=expandEll(outN,nE).map(function(a){ if(a.length!==1) throw '输出里不要用括号'; return a[0]; });
+    var sz={};
+    function reg(a,n){ if(sz[a]&&sz[a]!==n) throw '轴 '+a+' 的长度不一致（'+sz[a]+' vs '+n+'）'; sz[a]=n; }
+    ax.forEach(function(a,i){reg(a,x.shape[i]);}); ay.forEach(function(a,i){reg(a,y.shape[i]);});
+    outN.forEach(function(a){ if(!sz[a]) throw '输出轴 '+a+' 没在输入里出现'; });
+    var all=Object.keys(sz), sum=all.filter(function(a){return outN.indexOf(a)<0;});
+    var oshape=outN.map(function(a){return sz[a];}), on=prod(oshape), sshape=sum.map(function(a){return sz[a];}), sn=prod(sshape);
+    var out={shape:oshape,v:[],c:[],srcs:[],srcsY:[],names:outN,sumAxes:sum};
+    for(var o=0;o<on;o++){
+      var oi=unravel(o,oshape), e={}; outN.forEach(function(a,k){e[a]=oi[k];});
+      var tot=0, sx=[], sy=[], terms=[];
+      for(var s=0;s<sn;s++){ var si=unravel(s,sshape); sum.forEach(function(a,k){e[a]=si[k];});
+        var xi=ravel(ax.map(function(a){return e[a];}),x.shape), yi=ravel(ay.map(function(a){return e[a];}),y.shape);
+        tot+=x.v[xi]*y.v[yi]; sx.push(xi); sy.push(yi); terms.push(x.v[xi]+'×'+y.v[yi]); }
+      out.v.push(tot); out.c.push(null); out.srcs.push(sx); out.srcsY.push(sy); out['t'+o]=terms;
+    }
+    out.explain=function(o){ var oi=unravel(o,oshape); return 'out['+oi.join(',')+'] = '+(sum.length?'Σ 对 '+sum.join(', ')+' 求和：':'')+out['t'+o].join(' + ')+' = '+out.v[o]+(sum.length?'':'（没有被求和的轴，只是逐元素相乘）'); };
+    out.namesX=ax; out.namesY=ay;
+    return out;
+  }
+  function fmt(v){ return Math.abs(v-Math.round(v))<1e-9?String(Math.round(v)):v.toFixed(2); }
+
+  function tensorHTML(t,id,title,names,colored){
+    var sh=t.shape, n=t.v.length, cells=function(start,rows,cols){ var h='<div class="g" style="grid-template-columns:repeat('+cols+',auto)">'; for(var i=0;i<rows*cols;i++){ var f=start+i, c=t.c[f]; var bg=(colored&&c!==null&&c!==undefined)?'hsl('+c+',70%,var(--l))':''; h+='<div class="c" data-t="'+id+'" data-i="'+f+'" style="'+(bg?'background:'+bg:'')+'">'+fmt(t.v[f])+'</div>'; } return h+'</div>'; };
+    var h='<div class="tbox"><h4>'+title+' <span class="mono muted">形状 ('+sh.join(', ')+')'+(names?' = ['+names.join(', ')+']':'')+'</span></h4>';
+    if(sh.length===0){ h+=cells(0,1,1); }
+    else if(sh.length===1){ h+=cells(0,1,sh[0]); }
+    else if(sh.length===2){ h+=cells(0,sh[0],sh[1]); }
+    else { var inner=sh[sh.length-2]*sh[sh.length-1], outer=n/inner, oshape=sh.slice(0,-2); h+='<div class="blocks">'; for(var b=0;b<outer;b++){ h+='<div class="block"><div class="lab">'+(names?names.slice(0,-2).map(function(nm,k){return nm+'='+unravel(b,oshape)[k];}).join(', '):'['+unravel(b,oshape).join(',')+']')+'</div>'+cells(b*inner,sh[sh.length-2],sh[sh.length-1])+'</div>'; } h+='</div>'; }
+    return h+'</div>';
+  }
+  function compute(){
+    stopFill(); $('err').style.display='none';
+    var mode=$('mode').value;
+    $('red').style.display=mode==='reduce'?'':'none';
+    $('ysl').style.display=mode==='einsum'?'':'none';
+    $('szl').style.display=mode==='einsum'?'none':'';
+    try{
+      var xs=parseShape($('xs').value);
+      if(!X || X.shape.join()!==xs.join() || X.forEinsum!==(mode==='einsum')){
+        X=mkTensor(xs, mode==='einsum'?function(i){return i%3+1;}:function(i){return i;}); X.forEinsum=(mode==='einsum');
+      }
+      if(mode==='einsum'){ var ys=parseShape($('ys').value); Y=mkTensor(ys,function(i){return (i*2)%3;}); OUT=einsum(X,Y,$('pat').value); }
+      else OUT=rearrange(X,$('pat').value,parseSizes($('sz').value),mode==='reduce'?$('red').value:null);
+    }catch(e){ $('err').style.display='block'; $('err').textContent='出错：'+e; $('view').innerHTML=X?tensorHTML(X,'x','输入 x',null,true):''; OUT=null; return; }
+    var h=tensorHTML(X,'x','输入 x',OUT.namesL||OUT.namesX,mode!=='einsum');
+    if(mode==='einsum') h+=tensorHTML(Y,'y','输入 y',OUT.namesY,false);
+    h+='<div class="arrow">→</div>'+tensorHTML(OUT,'o','输出',OUT.names,mode==='rearrange');
+    $('view').innerHTML=h;
+    $('info').textContent=mode==='einsum'?('输出中没出现的轴（'+(OUT.sumAxes.join(', ')||'无')+'）会被求和消掉。悬停/点击输出格子查看计算过程。'):(mode==='reduce'?'被省略的轴会被 '+$('red').value+' 归约掉。悬停/点击输出格子查看来源。':'rearrange 只是“换位置”，元素一个不多一个不少。悬停/点击输出格子查看来源。');
+    $('code').textContent=curCode?('等价的 PyTorch 写法：'+curCode):'';
+    $('chain').disabled=(mode==='einsum');
+  }
+  function highlight(o){
+    Array.prototype.forEach.call(document.querySelectorAll('.c.on'),function(c){c.classList.remove('on');});
+    if(!OUT||o<0) return;
+    var q=function(t,i){var el=document.querySelector('.c[data-t="'+t+'"][data-i="'+i+'"]'); if(el) el.classList.add('on');};
+    q('o',o); OUT.srcs[o].forEach(function(i){q('x',i);}); if(OUT.srcsY) OUT.srcsY[o].forEach(function(i){q('y',i);});
+    $('info').textContent=OUT.explain(o);
+  }
+  $('view').addEventListener('mouseover',function(e){ var c=e.target.closest&&e.target.closest('.c[data-t="o"]'); if(c&&!timer) highlight(+c.getAttribute('data-i')); });
+  $('view').addEventListener('click',function(e){ var c=e.target.closest&&e.target.closest('.c[data-t="o"]'); if(c){stopFill(); highlight(+c.getAttribute('data-i'));} });
+  function stopFill(){ if(timer){clearInterval(timer);timer=null;} $('fill').textContent='逐个填充输出'; Array.prototype.forEach.call(document.querySelectorAll('.c.empty'),function(c){c.classList.remove('empty');}); }
+  $('fill').onclick=function(){
+    if(timer){stopFill();return;} if(!OUT) return;
+    var outs=document.querySelectorAll('.c[data-t="o"]'); Array.prototype.forEach.call(outs,function(c){c.classList.add('empty');});
+    fillPos=0; this.textContent='停止';
+    var tick=function(){ if(fillPos>=OUT.v.length){ stopFill(); return; } var el=document.querySelector('.c[data-t="o"][data-i="'+fillPos+'"]'); if(el) el.classList.remove('empty'); highlight(fillPos); fillPos++; };
+    tick(); timer=setInterval(tick, OUT.v.length>30?350:650);
+  };
+  $('chain').onclick=function(){ if(!OUT||$('mode').value==='einsum') return; X={shape:OUT.shape.slice(),v:OUT.v.slice(),c:OUT.c.map(function(c,i){return c===null?hue(i,OUT.v.length):c;}),forEinsum:false}; $('xs').value=X.shape.join(','); curCode=''; compute(); };
+  function loadPreset(i){ var p=PRESETS[i]; $('mode').value=p.m; if(p.r) $('red').value=p.r; $('pat').value=p.p; $('xs').value=p.xs; if(p.ys) $('ys').value=p.ys; $('sz').value=p.sz||''; curCode=p.code; X=null; compute(); }
+  $('preset').onchange=function(){loadPreset(+this.value);};
+  ['pat','xs','ys','sz'].forEach(function(id){ $(id).addEventListener('input',function(){ curCode=''; if(id==='xs') X=null; compute(); }); });
+  $('mode').onchange=function(){ curCode=''; X=null; compute(); };
+  $('red').onchange=function(){ curCode=''; compute(); };
+  loadPreset(0);
+})();
+</script>
+</body>
+</html>

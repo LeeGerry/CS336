@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPU 内存层级</title>
+<style>
+:root{
+  --bg:#ffffff; --fg:#1f2328; --muted:#656d76; --card:#f6f8fa; --border:#d0d7de;
+  --reg:#7b4fd6; --smem:#2e7d32; --l2:#c77d00; --hbm:#d1495b; --accent:#3b6fd8;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#16181d; --fg:#e6e8eb; --muted:#9aa4b2; --card:#20242b; --border:#363c46;
+    --reg:#b393ff; --smem:#6fd17a; --l2:#ffb84d; --hbm:#ff7a85; --accent:#7aa2ff;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+h1{font-size:16px;margin:0 0 8px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+button,select{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 10px;cursor:pointer}
+button.on{border-color:var(--accent);color:var(--accent);font-weight:600}
+canvas{width:100%;display:block;border-radius:8px;background:var(--card);border:1px solid var(--border)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-top:8px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:6px 10px}
+.card b{display:block;font-size:16px}
+.small{font-size:12px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:12px;margin-top:8px}
+th,td{border:1px solid var(--border);padding:3px 6px;text-align:center}
+th{background:var(--card)}
+.tw{overflow-x:auto}
+</style>
+</head>
+<body>
+<h1>数据从哪儿来？——同一个数被用 R 次时，三种取数策略</h1>
+<div class="row" id="modes">
+  <button data-m="hbm" class="on">每次都去 HBM 取</button>
+  <button data-m="smem">先搬进共享内存再复用（分块）</button>
+  <button data-m="reg">再放进寄存器复用</button>
+</div>
+<div class="row">
+  <span>复用次数 R = <b id="rTxt">8</b></span>
+  <input id="r" type="range" min="2" max="16" value="8" style="flex:1;min-width:120px">
+  <button id="play">▶ 播放</button>
+  <button id="step">单步</button>
+  <button id="reset">重置</button>
+</div>
+<canvas id="cv"></canvas>
+<div class="stats">
+  <div class="card"><span class="small">HBM 访问次数</span><b id="cH">0</b></div>
+  <div class="card"><span class="small">共享内存访问次数</span><b id="cS">0</b></div>
+  <div class="card"><span class="small">寄存器访问次数</span><b id="cR">0</b></div>
+  <div class="card"><span class="small">累计等待（示意周期）</span><b id="cC">0</b></div>
+</div>
+<p id="msg" class="small" style="font-size:13px"></p>
+<div class="tw">
+<table>
+<tr><th>层级（课程 Lecture 6 数据）</th><th>A100</th><th>H100</th><th>B200</th><th>位置</th></tr>
+<tr><td>寄存器（每 SM）</td><td>256 KB</td><td>256 KB</td><td>256 KB</td><td>SM 内</td></tr>
+<tr><td>L1 + 共享内存（每 SM）</td><td>192 KB</td><td>256 KB</td><td>256 KB</td><td>SM 内</td></tr>
+<tr><td>L2 缓存（全芯片）</td><td>40 MB</td><td>50 MB</td><td>96–126 MB</td><td>芯片上</td></tr>
+<tr><td>HBM（全局内存）</td><td>80 GB</td><td>80 GB</td><td>192 GB</td><td>芯片旁</td></tr>
+<tr><td>HBM 带宽</td><td>2 TB/s</td><td>3.35 TB/s</td><td>8 TB/s</td><td></td></tr>
+<tr><td>共享内存带宽（粗估）</td><td>~19 TB/s</td><td>~33 TB/s</td><td>~40 TB/s</td><td></td></tr>
+</table>
+</div>
+<p class="small">动画中的延迟是示意值：共享内存约 30 周期（课上 A100 测得 L1/共享内存约 20–30 周期），HBM 取为其约 10 倍；寄存器约 1 周期。真实数值随硬件而变。</p>
+<script>
+(function(){
+const $=id=>document.getElementById(id);
+const LAT={reg:1, smem:30, l2:150, hbm:300};
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+let busy=false;
+let mode='hbm', ops=[], idx=0, anim=null, playing=false, cnt, gen=0;
+function build(){
+  const R=+$('r').value; ops=[];
+  if(mode==='hbm'){ for(let i=0;i<R;i++) ops.push({path:['hbm','l2','smem','reg'], cost:LAT.hbm, kind:'H', label:'第 '+(i+1)+' 次使用：又去 HBM 取一遍'}); }
+  if(mode==='smem'){ ops.push({path:['hbm','l2','smem'], cost:LAT.hbm, kind:'H', label:'一次性把这块数据从 HBM 搬进共享内存'});
+    for(let i=0;i<R;i++) ops.push({path:['smem','reg'], cost:LAT.smem, kind:'S', label:'第 '+(i+1)+' 次使用：从共享内存读'}); }
+  if(mode==='reg'){ ops.push({path:['hbm','l2','smem'], cost:LAT.hbm, kind:'H', label:'从 HBM 搬进共享内存'});
+    ops.push({path:['smem','reg'], cost:LAT.smem, kind:'S', label:'从共享内存读进寄存器'});
+    for(let i=0;i<R;i++) ops.push({path:['reg'], cost:LAT.reg, kind:'R', label:'第 '+(i+1)+' 次使用：直接用寄存器里的值'}); }
+  gen++; busy=false; idx=0; cnt={H:0,S:0,R:0,C:0}; anim=null; update(); draw();
+}
+function update(){
+  $('cH').textContent=cnt.H; $('cS').textContent=cnt.S; $('cR').textContent=cnt.R; $('cC').textContent=cnt.C;
+  $('rTxt').textContent=$('r').value;
+  const R=+$('r').value;
+  const tot={hbm:R*LAT.hbm, smem:LAT.hbm+R*LAT.smem, reg:LAT.hbm+LAT.smem+R*LAT.reg};
+  let m = idx<ops.length && ops[idx] ? '下一步：'+ops[idx].label : '完成。';
+  m += '　三种策略总等待：每次去 HBM '+tot.hbm+'，共享内存复用 '+tot.smem+'，寄存器复用 '+tot.reg+'（示意周期）。';
+  $('msg').textContent=m;
+}
+const LEVELS=[['reg','寄存器 / 计算单元','--reg'],['smem','共享内存 / L1（SM 内）','--smem'],['l2','L2 缓存（芯片上）','--l2'],['hbm','HBM 全局内存（芯片外）','--hbm']];
+function ly(k,H){ const i=LEVELS.findIndex(l=>l[0]===k); return 24+i*(H-48)/3; }
+function draw(){
+  const cv=$('cv'), ctx=cv.getContext('2d'), dpr=window.devicePixelRatio||1, W=cv.clientWidth, H=260;
+  cv.style.height=H+'px'; cv.width=W*dpr; cv.height=H*dpr; ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,W,H);
+  ctx.font='12px sans-serif';
+  LEVELS.forEach(([k,name,c])=>{
+    const y=ly(k,H); ctx.fillStyle=css(c); ctx.globalAlpha=0.18; ctx.fillRect(8,y-14,W-16,28); ctx.globalAlpha=1;
+    ctx.fillStyle=css(c); ctx.fillRect(8,y-14,4,28);
+    ctx.fillStyle=css('--fg'); ctx.textAlign='left'; ctx.fillText(name, 18, y+4);
+    ctx.fillStyle=css('--muted'); ctx.textAlign='right'; ctx.fillText('延迟≈'+LAT[k]+' 周期', W-14, y+4);
+  });
+  // 竖直通道
+  const cx=W*0.62;
+  ctx.strokeStyle=css('--border'); ctx.lineWidth=6; ctx.beginPath(); ctx.moveTo(cx, ly('reg',H)); ctx.lineTo(cx, ly('hbm',H)); ctx.stroke();
+  if(anim){
+    const p=anim.op.path, segs=p.length-1, t=Math.min(1,anim.t);
+    let y;
+    if(segs===0){ y=ly(p[0],H); }
+    else { const f=t*segs, i=Math.min(segs-1,Math.floor(f)), r=f-i; y=ly(p[i],H)+(ly(p[i+1],H)-ly(p[i],H))*r; }
+    ctx.fillStyle=css(anim.op.kind==='H'?'--hbm':anim.op.kind==='S'?'--smem':'--reg');
+    ctx.beginPath(); ctx.arc(cx,y,9,0,Math.PI*2); ctx.fill();
+    if(segs===0){ ctx.strokeStyle=ctx.fillStyle; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(cx,y,9+8*t,0,Math.PI*2); ctx.stroke(); }
+  }
+}
+function stepOnce(done){
+  if(idx>=ops.length){ playing=false; $('play').textContent='▶ 播放'; done&&done(); return; }
+  const op=ops[idx]; const dur=120+op.cost*2.2; const t0=performance.now(); const g=gen;
+  function f(now){
+    if(g!==gen) return;
+    anim={op, t:(now-t0)/dur}; draw();
+    if(anim.t<1) requestAnimationFrame(f);
+    else { cnt[op.kind]++; cnt.C+=op.cost; idx++; anim=null; draw(); update(); done&&done(); }
+  }
+  requestAnimationFrame(f);
+}
+function loop(){ if(!playing) return; busy=true; stepOnce(()=>{ busy=false; if(playing && idx<ops.length) setTimeout(loop,80); else {playing=false;$('play').textContent='▶ 播放';} }); }
+$('play').onclick=()=>{ if(playing){playing=false;$('play').textContent='▶ 播放';return;} if(idx>=ops.length) build(); playing=true; $('play').textContent='⏸ 暂停'; if(!busy) loop(); };
+$('step').onclick=()=>{ if(busy) return; playing=false; $('play').textContent='▶ 播放'; busy=true; stepOnce(()=>{busy=false; if(playing) loop();}); };
+$('reset').onclick=()=>{ playing=false; $('play').textContent='▶ 播放'; build(); };
+$('r').oninput=()=>{ playing=false; $('play').textContent='▶ 播放'; build(); };
+document.querySelectorAll('#modes button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('#modes button').forEach(x=>x.classList.toggle('on',x===b));
+  mode=b.dataset.m; playing=false; $('play').textContent='▶ 播放'; build();
+});
+window.addEventListener('resize',draw);
+build();
+})();
+</script>
+</body>
+</html>

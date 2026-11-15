@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transformer Block 数据流</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#656d76;--card:#f6f8fa;--border:#d0d7de;--accent:#0969da;--res:#1a7f37;--norm:#9a6700;--attn:#0969da;--ffn:#8250df;--hl:#bf3989;}
+@media (prefers-color-scheme: dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8d96a0;--card:#161b22;--border:#30363d;--accent:#4493f8;--res:#3fb950;--norm:#d29922;--attn:#4493f8;--ffn:#a371f7;--hl:#db61a2;}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+.wrap{max-width:760px;margin:0 auto;padding:12px}
+h3{margin:4px 0 8px;font-size:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px}
+.grid2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.1fr);gap:10px;align-items:start}
+@media (max-width:600px){.grid2{grid-template-columns:1fr}}
+svg{width:100%;height:auto;display:block}
+button,select{background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-size:13px;cursor:pointer}
+button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+.row{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:6px}
+.expl{font-size:13px;min-height:66px}
+.shape{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:var(--hl)}
+table{border-collapse:collapse;width:100%;font-size:12.5px;font-variant-numeric:tabular-nums}
+td{border-bottom:1px solid var(--border);padding:3px 4px}
+td:last-child{text-align:right}
+.inp{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+.inp label{font-size:11.5px;color:var(--muted);display:flex;flex-direction:column}
+.inp input{width:100%;padding:3px 4px;font-size:13px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px}
+.small{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h3>一个 Transformer block 里，数据怎么流动？</h3>
+<div class="row">
+  <button id="bPre" class="on">Pre-norm（现代 LLM）</button>
+  <button id="bPost">Post-norm（原始 Transformer）</button>
+  <button id="play">▶ 播放数据流</button>
+  <button id="stepb">单步</button>
+</div>
+<div class="grid2">
+  <div class="card"><svg id="svg" viewBox="0 0 300 440"></svg></div>
+  <div>
+    <div class="card"><div class="expl" id="expl">点击“播放”或“单步”，跟着一个 batch 的张量走一遍 block。</div></div>
+    <div class="card">
+      <div class="row"><span style="font-size:13px">预设：</span>
+        <select id="preset">
+          <option value="a1">A1 TinyStories 小模型</option>
+          <option value="llama">LLaMA 2 70B 形状</option>
+          <option value="gpt3">GPT-3 175B 形状</option>
+        </select>
+      </div>
+      <div class="inp">
+        <label>d_model<input id="d" type="number"></label>
+        <label>层数 L<input id="L" type="number"></label>
+        <label>查询头数 h<input id="h" type="number"></label>
+        <label>KV 头数<input id="kv" type="number"></label>
+        <label>d_ff<input id="ff" type="number"></label>
+        <label>词表 V<input id="V" type="number"></label>
+        <label>batch B<input id="B" type="number"></label>
+        <label>序列长 T<input id="T" type="number"></label>
+        <label>FFN 类型<select id="glu"><option value="1">SwiGLU（3 个矩阵）</option><option value="0">ReLU/GELU（2 个矩阵）</option></select></label>
+      </div>
+      <table id="tbl" style="margin-top:8px"></table>
+      <div class="small" id="note" style="margin-top:4px"></div>
+    </div>
+  </div>
+</div>
+</div>
+<script>
+(function(){
+  var $=function(id){return document.getElementById(id);};
+  var PRE={
+    a1:{d:512,L:4,h:16,kv:16,ff:1344,V:10000,B:32,T:256,glu:1},
+    llama:{d:8192,L:80,h:64,kv:8,ff:28672,V:32000,B:1,T:4096,glu:1},
+    gpt3:{d:12288,L:96,h:96,kv:96,ff:49152,V:50257,B:1,T:2048,glu:0}
+  };
+  var mode="pre", cur=-1, timer=null;
+  function P(){ return {d:+$("d").value,L:+$("L").value,h:+$("h").value,kv:+$("kv").value,ff:+$("ff").value,V:+$("V").value,B:+$("B").value,T:+$("T").value,glu:+$("glu").value}; }
+  function loadPreset(k){ var p=PRE[k]; for(var key in p){ $(key).value=p[key]; } update(); }
+
+  // nodes: id, label, y, type
+  function nodes(){
+    if(mode==="pre") return [
+      {id:"in",t:"输入 x（残差流）",y:410,c:"--res"},
+      {id:"n1",t:"RMSNorm",y:350,c:"--norm",x:200},
+      {id:"at",t:"多头自注意力",y:295,c:"--attn",x:200},
+      {id:"a1",t:"⊕ 加回残差流",y:240,c:"--res"},
+      {id:"n2",t:"RMSNorm",y:185,c:"--norm",x:200},
+      {id:"ff",t:"SwiGLU FFN",y:130,c:"--ffn",x:200},
+      {id:"a2",t:"⊕ 加回残差流",y:75,c:"--res"},
+      {id:"out",t:"输出 → 下一个 block",y:20,c:"--res"}
+    ];
+    return [
+      {id:"in",t:"输入 x",y:410,c:"--res"},
+      {id:"at",t:"多头自注意力",y:350,c:"--attn",x:200},
+      {id:"a1",t:"⊕ 残差相加",y:295,c:"--res"},
+      {id:"n1",t:"LayerNorm（在主干上）",y:240,c:"--norm"},
+      {id:"ff",t:"ReLU FFN",y:185,c:"--ffn",x:200},
+      {id:"a2",t:"⊕ 残差相加",y:130,c:"--res"},
+      {id:"n2",t:"LayerNorm（在主干上）",y:75,c:"--norm"},
+      {id:"out",t:"输出 → 下一个 block",y:20,c:"--res"}
+    ];
+  }
+  function css(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+  function draw(){
+    var ns=nodes(), s="", X0=80;
+    s+="<line x1='"+X0+"' y1='430' x2='"+X0+"' y2='10' stroke='"+css("--res")+"' stroke-width='6' opacity='0.35'/>";
+    s+="<text x='6' y='432' font-size='10' fill='"+css("--muted")+"'>残差流（主干道）</text>";
+    // branch connections
+    for(var i=0;i<ns.length;i++){
+      var n=ns[i], x=n.x||X0;
+      if(n.x){
+        var prev=ns[i-1], px=prev.x||X0;
+        s+="<path d='M"+px+" "+(prev.y)+" L"+px+" "+(prev.y-14)+" L"+x+" "+(prev.y-14)+" L"+x+" "+(n.y+12)+"' fill='none' stroke='"+css("--border")+"' stroke-width='2'/>";
+      }
+      if(n.id==="a1"||n.id==="a2"){
+        var br=ns[i-1];
+        if(br.x){ s+="<path d='M"+br.x+" "+(br.y-12)+" L"+br.x+" "+(n.y)+" L"+(X0+70)+" "+(n.y)+"' fill='none' stroke='"+css("--border")+"' stroke-width='2'/>"; }
+      }
+    }
+    for(i=0;i<ns.length;i++){
+      n=ns[i]; x=n.x||X0;
+      var on=(i===cur), w=140, col=css(n.c);
+      s+="<rect x='"+(x-w/2)+"' y='"+(n.y-12)+"' width='"+w+"' height='24' rx='6' fill='"+(on?col:css("--bg"))+"' stroke='"+col+"' stroke-width='"+(on?3:1.5)+"'/>";
+      s+="<text x='"+x+"' y='"+(n.y+4)+"' text-anchor='middle' font-size='11.5' fill='"+(on?"#fff":css("--fg"))+"'>"+n.t+"</text>";
+    }
+    if(cur>=0){ var cn=ns[cur]; var cx=(cn.x||X0); s+="<circle cx='"+(cx-78)+"' cy='"+cn.y+"' r='6' fill='"+css("--hl")+"'><animate attributeName='r' values='4;8;4' dur='0.8s' repeatCount='indefinite'/></circle>"; }
+    $("svg").innerHTML=s;
+  }
+  function fmt(x){ if(x>=1e9) return (x/1e9).toFixed(2)+" B"; if(x>=1e6) return (x/1e6).toFixed(2)+" M"; if(x>=1e3) return (x/1e3).toFixed(1)+" K"; return String(x); }
+  function bytes(x){ if(x>=1073741824) return (x/1073741824).toFixed(2)+" GiB"; if(x>=1048576) return (x/1048576).toFixed(2)+" MiB"; if(x>=1024) return (x/1024).toFixed(1)+" KiB"; return x+" B"; }
+  function explain(){
+    var p=P(), hd=Math.round(p.d/p.h), ns=nodes(); if(cur<0) return;
+    var id=ns[cur].id, B=p.B, T=p.T, d=p.d, s="";
+    var sh="("+B+", "+T+", "+d+")";
+    if(id==="in") s="进入 block 的是残差流张量 <span class='shape'>"+sh+"</span>：batch 里每条序列、每个位置，都有一个 d_model 维向量。";
+    if(id==="n1"&&mode==="pre") s="先做 RMSNorm：对每个位置的向量单独“调音量”，形状不变 <span class='shape'>"+sh+"</span>。注意它在支路上，主干不受影响。";
+    if(id==="at") s="注意力：投影出 Q <span class='shape'>("+B+", "+p.h+", "+T+", "+hd+")</span>，K、V 各 <span class='shape'>("+B+", "+p.kv+", "+T+", "+hd+")</span>；打分矩阵 <span class='shape'>("+B+", "+p.h+", "+T+", "+T+")</span>（随 T 平方增长！）；输出拼回 <span class='shape'>"+sh+"</span>。这是唯一让不同位置交换信息的地方。";
+    if(id==="a1"||id==="a2") s="残差相加：x ← x + 子层输出。子层只需学一个“修正量”，梯度也能沿主干直通回去。形状 <span class='shape'>"+sh+"</span>。";
+    if(id==="n2"&&mode==="pre") s="第二个 RMSNorm，同样只在支路上。";
+    if((id==="n1"||id==="n2")&&mode==="post") s="Post-norm：LayerNorm 放在残差相加之后、主干之上。每经过一层，主干信号都被重新归一化一次，深层时梯度传播更不稳定，通常需要学习率预热。";
+    if(id==="ff") s="FFN：每个位置独立处理。先升维到 <span class='shape'>("+B+", "+T+", "+p.ff+")</span>"+(p.glu?"（SwiGLU 同时算门控分支，同样大小）":"")+"，过非线性，再降回 <span class='shape'>"+sh+"</span>。参数量的大头在这里。";
+    if(id==="out") s="输出形状和输入一模一样 <span class='shape'>"+sh+"</span>，所以 block 可以像乐高一样叠 L = "+p.L+" 层。最后一层后接 final norm 和输出层（d_model → 词表 "+p.V+"）。";
+    $("expl").innerHTML="<b>第 "+(cur+1)+"/"+ns.length+" 步</b>："+s;
+  }
+  function update(){
+    var p=P(), hd=p.d/p.h;
+    var q=p.d*p.h*hd, kvp=2*p.d*p.kv*hd, o=p.h*hd*p.d;
+    var attn=q+kvp+o, ffn=(p.glu?3:2)*p.d*p.ff, norm=2*p.d, per=attn+ffn+norm;
+    var emb=p.V*p.d, head=p.V*p.d, total=per*p.L+emb+head+p.d;
+    var kvTok=2*p.kv*hd*p.L*2; // bf16
+    var mhaTok=2*p.h*hd*p.L*2;
+    var r=[
+      ["每层注意力参数（Q,K,V,O）",fmt(attn)],
+      ["每层 FFN 参数",fmt(ffn)],
+      ["每层合计",fmt(per)],
+      ["L 层合计",fmt(per*p.L)],
+      ["词嵌入 + 输出层（不共享）",fmt(emb+head)],
+      ["总参数量（约）","<b>"+fmt(total)+"</b>"],
+      ["head_dim = d_model / h",String(hd)],
+      ["d_ff / d_model",(p.ff/p.d).toFixed(2)],
+      ["d_model / L（宽深比）",(p.d/p.L).toFixed(0)],
+      ["KV cache / 每个 token（bf16）",bytes(kvTok)+(p.kv<p.h?"（若不用 GQA："+bytes(mhaTok)+"）":"")],
+      ["KV cache / 整个 batch",bytes(kvTok*p.B*p.T)]
+    ];
+    $("tbl").innerHTML=r.map(function(x){return "<tr><td>"+x[0]+"</td><td>"+x[1]+"</td></tr>";}).join("");
+    $("note").textContent = (p.d%p.h!==0?"注意：d_model 不能被 h 整除。":"")+(p.h%p.kv!==0?" 注意：查询头数应是 KV 头数的整数倍。":"")+" 未计入 RoPE（无参数）和偏置（现代模型通常不用）。";
+    explain();
+  }
+  function stepOnce(){ var ns=nodes(); cur=(cur+1)%ns.length; draw(); explain(); }
+  $("stepb").onclick=stepOnce;
+  $("play").onclick=function(){
+    var b=this;
+    if(timer){ clearInterval(timer); timer=null; b.textContent="▶ 播放数据流"; return; }
+    b.textContent="⏸ 暂停"; cur=-1; stepOnce();
+    timer=setInterval(function(){ if(cur>=nodes().length-1){ clearInterval(timer); timer=null; b.textContent="▶ 播放数据流"; return; } stepOnce(); },2200);
+  };
+  $("bPre").onclick=function(){ mode="pre"; this.className="on"; $("bPost").className=""; draw(); explain(); };
+  $("bPost").onclick=function(){ mode="post"; this.className="on"; $("bPre").className=""; draw(); explain(); };
+  ["d","L","h","kv","ff","V","B","T","glu"].forEach(function(id){ $(id).oninput=update; $(id).onchange=update; });
+  $("preset").onchange=function(){ loadPreset(this.value); };
+  loadPreset("a1"); draw();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>波量化 Wave Quantization</title>
+<style>
+:root{
+  --bg:#ffffff; --fg:#1f2328; --muted:#656d76; --card:#f6f8fa; --border:#d0d7de;
+  --w1:#3b6fd8; --w2:#d1495b; --idle:#e3e7ec; --accent:#3b6fd8; --ok:#2e7d32;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#16181d; --fg:#e6e8eb; --muted:#9aa4b2; --card:#20242b; --border:#363c46;
+    --w1:#7aa2ff; --w2:#ff7a85; --idle:#2c323b; --accent:#7aa2ff; --ok:#6fd17a;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+h1{font-size:16px;margin:0 0 8px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+select,button{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 8px}
+input[type=range]{flex:1;min-width:140px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-top:8px}
+#sms{display:grid;gap:2px;margin-top:6px}
+#sms div{aspect-ratio:1;border-radius:2px}
+canvas{width:100%;display:block;border-radius:8px;background:var(--card);border:1px solid var(--border);margin-top:8px}
+.small{font-size:12px;color:var(--muted)}
+.legend span{display:inline-block;width:10px;height:10px;border-radius:2px;margin:0 4px 0 10px;vertical-align:middle}
+</style>
+</head>
+<body>
+<h1>矩阵大 1 一点，反而慢一截？——波量化</h1>
+<div class="row">
+  <label>GPU</label>
+  <select id="gpu"><option value="108" selected>A100（108 个 SM）</option><option value="132">H100（132 个 SM）</option><option value="148">B200（148 个 SM）</option></select>
+  <label>分块</label>
+  <select id="tile"><option value="256x128" selected>256 × 128</option><option value="128x128">128 × 128</option><option value="128x64">128 × 64</option></select>
+</div>
+<div class="row">
+  <span>方阵边长 n = <b id="nTxt"></b></span>
+  <input id="n" type="range" min="512" max="4096" step="1" value="1792">
+  <button id="b1">1792</button><button id="b2">1793</button>
+</div>
+<div class="card" id="info"></div>
+<div class="card">
+  <div class="small legend">每个小方块是一个 SM。<span style="background:var(--w1)"></span>第 1 波 <span style="background:var(--w2)"></span>最后一波 <span style="background:var(--idle)"></span>最后一波空闲</div>
+  <div id="sms"></div>
+</div>
+<canvas id="cv"></canvas>
+<p class="small">折线：在当前 GPU 与分块下，SM 平均利用率 = 分块数 ÷（波数 × SM 数）随 n 的变化。锯齿每一次下跌都是“多出一小波”。课上的例子：A100 上 n=1792 时 7×14=98 个分块，一波装得下；n=1793 时变成 8×15=120 个分块，超过 108，只好再跑一波只有 12 个分块的“尾巴”。</p>
+<script>
+(function(){
+const $=id=>document.getElementById(id);
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+function calc(n){
+  const [tm,tn]=$('tile').value.split('x').map(Number);
+  const sm=+$('gpu').value;
+  const a=Math.ceil(n/tm), b=Math.ceil(n/tn), tiles=a*b, waves=Math.ceil(tiles/sm);
+  const last=tiles-(waves-1)*sm;
+  return {tm,tn,sm,a,b,tiles,waves,last,util:tiles/(waves*sm)};
+}
+function render(){
+  const n=+$('n').value; $('nTxt').textContent=n;
+  const r=calc(n);
+  $('info').innerHTML=
+    '分块数 = ⌈'+n+'/'+r.tm+'⌉ × ⌈'+n+'/'+r.tn+'⌉ = '+r.a+' × '+r.b+' = <b>'+r.tiles+'</b>；'+
+    'SM 数 = '+r.sm+'，需要 <b>'+r.waves+'</b> 波。最后一波只有 <b>'+r.last+'</b> 个分块，'+
+    (r.sm-r.last)+' 个 SM 在空等。<br>平均 SM 利用率 ≈ <b style="color:'+(r.util>0.85?'var(--ok)':'var(--w2)')+'">'+(r.util*100).toFixed(1)+'%</b>';
+  const box=$('sms'); const cols=Math.min(r.sm, Math.max(12, Math.round(box.clientWidth/14)));
+  box.style.gridTemplateColumns='repeat('+cols+',1fr)';
+  box.innerHTML='';
+  const showWaves=Math.min(r.waves,3);
+  for(let w=1; w<=r.waves; w++){
+    if(r.waves>3 && w>1 && w<r.waves) continue;
+    const label=document.createElement('div'); label.style.gridColumn='1 / -1'; label.style.aspectRatio='auto';
+    label.className='small'; label.textContent= (w===r.waves && r.waves>1)? '最后一波（第 '+w+' 波）' : (r.waves>3 && w===1? '第 1 波（中间 '+(r.waves-2)+' 波省略，均满载）':'第 '+w+' 波');
+    box.appendChild(label);
+    for(let i=0;i<r.sm;i++){
+      const d=document.createElement('div');
+      const full = w<r.waves || i<r.last;
+      d.style.background = full ? (w===r.waves && r.waves>1 ? css('--w2') : css('--w1')) : css('--idle');
+      if(w===r.waves && r.waves===1) d.style.background = i<r.last? css('--w1'):css('--idle');
+      box.appendChild(d);
+    }
+  }
+  drawChart(n);
+}
+function drawChart(cur){
+  const cv=$('cv'), ctx=cv.getContext('2d'), dpr=window.devicePixelRatio||1, W=cv.clientWidth, H=170;
+  cv.style.height=H+'px'; cv.width=W*dpr; cv.height=H*dpr; ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,W,H);
+  const L=40,R=10,T=10,B=24, pw=W-L-R, ph=H-T-B, n0=512, n1=4096;
+  const X=n=>L+(n-n0)/(n1-n0)*pw, Y=u=>T+ph-u*ph;
+  ctx.font='11px sans-serif'; ctx.fillStyle=css('--muted'); ctx.strokeStyle=css('--border');
+  [0,0.5,1].forEach(u=>{ctx.beginPath();ctx.moveTo(L,Y(u));ctx.lineTo(L+pw,Y(u));ctx.stroke();ctx.textAlign='right';ctx.fillText((u*100)+'%',L-4,Y(u)+4);});
+  [512,1024,2048,3072,4096].forEach(n=>{ctx.textAlign='center';ctx.fillText(n,X(n),H-6);});
+  ctx.strokeStyle=css('--accent'); ctx.lineWidth=1.5; ctx.beginPath();
+  for(let n=n0;n<=n1;n+=1){ const u=calc(n).util; const x=X(n), y=Y(u); if(n===n0) ctx.moveTo(x,y); else ctx.lineTo(x,y); }
+  ctx.stroke();
+  const u=calc(cur).util; ctx.fillStyle=css('--w2'); ctx.beginPath(); ctx.arc(X(cur),Y(u),5,0,Math.PI*2); ctx.fill();
+}
+$('n').oninput=render; $('gpu').onchange=render; $('tile').onchange=render;
+$('b1').onclick=()=>{$('n').value=1792;render();}; $('b2').onclick=()=>{$('n').value=1793;render();};
+window.addEventListener('resize',render);
+render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>投机解码演示</title>
+<style>
+:root{ --bg:#ffffff; --panel:#f5f6f8; --fg:#1d2330; --muted:#667085; --line:#d0d5dd; --accent:#2563eb; --track:#e5e7eb;
+  --draft:#94a3b8; --ok:#16a34a; --bad:#dc2626; --fix:#ea580c; --bonus:#9333ea; --q:#2563eb; --p:#f59e0b; --emp:#16a34a; }
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#111418; --panel:#1b2027; --fg:#e6e9ef; --muted:#98a2b3; --line:#344054; --accent:#60a5fa; --track:#2a313c;
+    --draft:#64748b; --ok:#22c55e; --bad:#f87171; --fix:#f97316; --bonus:#a855f7; --q:#3b82f6; --p:#fbbf24; --emp:#4ade80; }
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;font-size:14px}
+.wrap{max-width:760px;margin:0 auto;padding:12px}
+h1{font-size:16px;margin:0 0 6px} h2{font-size:15px;margin:16px 0 6px}
+button{font:inherit;border:1px solid var(--line);background:var(--panel);color:var(--fg);padding:5px 10px;border-radius:6px;cursor:pointer}
+button:disabled{opacity:.45;cursor:not-allowed}
+.grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px 12px}
+@media (max-width:560px){ .grid{grid-template-columns:1fr} }
+label{display:block;font-size:12px;color:var(--muted);margin-bottom:2px}
+label b{color:var(--fg)}
+input[type=range]{width:100%}
+.ctrl{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0;align-items:center}
+.seq{display:flex;flex-wrap:wrap;gap:5px;min-height:40px;background:var(--panel);border-radius:10px;padding:8px}
+.tok{padding:5px 9px;border-radius:6px;color:#fff;font-weight:600;font-size:14px;transition:all .3s}
+.tok small{display:block;font-weight:400;font-size:10px;opacity:.9}
+.t-ctx{background:var(--muted)} .t-ok{background:var(--ok)} .t-fix{background:var(--fix)} .t-bonus{background:var(--bonus)} .t-draft{background:var(--draft)} .t-bad{background:var(--bad);text-decoration:line-through}
+.round{background:var(--panel);border-radius:10px;padding:8px;margin-top:8px}
+.round .row{display:flex;flex-wrap:wrap;gap:5px;align-items:flex-start}
+.chk{font-size:12px;line-height:1.5;margin-top:6px}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px}
+@media (max-width:560px){ .stats{grid-template-columns:repeat(2,1fr)} }
+.stat{background:var(--panel);border-radius:8px;padding:6px 8px;font-size:11.5px;color:var(--muted)}
+.stat b{display:block;color:var(--fg);font-size:15px}
+.card{background:var(--panel);border-radius:10px;padding:10px;margin-top:8px;font-size:13px;line-height:1.65}
+.legend{display:flex;flex-wrap:wrap;gap:10px;font-size:12px;color:var(--muted);margin:6px 0}
+.legend span::before{content:"";display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px;background:var(--c)}
+svg{width:100%;height:auto;display:block}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>投机解码：小模型猜，大模型批量验证</h1>
+  <div class="grid">
+    <div><label>每轮草稿 token 数 k：<b id="vK"></b></label><input id="K" type="range" min="1" max="8" value="4"></div>
+    <div><label>草稿模型与目标模型的相似度 λ：<b id="vL"></b></label><input id="L" type="range" min="0" max="100" value="70"></div>
+    <div><label>草稿模型单次成本 / 目标模型单次成本：<b id="vC"></b></label><input id="C" type="range" min="1" max="50" value="10"></div>
+  </div>
+  <div class="legend"><span style="--c:var(--muted)">已有文本</span><span style="--c:var(--draft)">草稿（待验证）</span><span style="--c:var(--ok)">接受</span><span style="--c:var(--bad)">拒绝</span><span style="--c:var(--fix)">拒绝后从残差分布重采样</span><span style="--c:var(--bonus)">全部接受时的奖励 token</span></div>
+  <div class="seq" id="seq"></div>
+  <div class="ctrl">
+    <button id="bRound">▶ 跑一轮（猜 → 验证）</button><button id="bAuto">⏩ 连续跑到 30 个 token</button><button id="bReset">⟲ 重置</button>
+  </div>
+  <div id="rounds"></div>
+  <div class="stats" id="stats"></div>
+
+  <h2>它真的是“无损”的吗？抽样验证</h2>
+  <div class="card">在固定上下文“我 喜欢”之后，只看投机解码产生的<b>第一个 token</b>：按草稿 p 抽样 → 以 min(1, q/p) 概率接受 → 否则从 max(q−p, 0) 归一化后的残差分布重抽。重复很多次，统计频率。
+    <div class="ctrl"><button id="bMC">🎲 抽样 20000 次</button><span id="mcInfo" style="font-size:12px;color:var(--muted)"></span></div>
+    <div class="legend"><span style="--c:var(--q)">目标模型 q</span><span style="--c:var(--p)">草稿模型 p</span><span style="--c:var(--emp)">投机解码实际输出频率</span></div>
+    <svg id="mc" viewBox="0 0 700 220"></svg>
+  </div>
+  <div class="card" style="color:var(--muted);font-size:12px">说明：这是一个 8 个词的玩具“语言模型”（目标模型 q 是手写的二元转移概率，草稿模型 p = λ·q + (1−λ)·一个有偏的分布）。
+    加速比估算：普通解码每个 token 要跑 1 次目标模型；投机解码每轮跑 k 次草稿模型 + 1 次目标模型（目标模型一次并行验证 k+1 个位置，因为 decode 受带宽限制，验证 k 个和验证 1 个耗时相近）。</div>
+</div>
+<script>
+(function(){
+  var VOC=["我","你","喜欢","讨厌","吃","苹果","香蕉","。"];
+  var V=VOC.length;
+  function idx(w){return VOC.indexOf(w);}
+  function dist(o){ var d=new Array(V).fill(0.01); for(var k in o) d[idx(k)]=o[k]; var s=d.reduce(function(a,b){return a+b;},0); return d.map(function(x){return x/s;}); }
+  // 目标模型 q：手写的二元转移
+  var Q={
+    "我":dist({"喜欢":.5,"讨厌":.2,"吃":.25}),
+    "你":dist({"喜欢":.45,"讨厌":.3,"吃":.2}),
+    "喜欢":dist({"吃":.5,"苹果":.2,"香蕉":.2,"你":.1}),
+    "讨厌":dist({"吃":.4,"苹果":.25,"香蕉":.25,"你":.1}),
+    "吃":dist({"苹果":.55,"香蕉":.4,"。":.05}),
+    "苹果":dist({"。":.7,"我":.1,"你":.1,"吃":.1}),
+    "香蕉":dist({"。":.7,"我":.1,"你":.1,"吃":.1}),
+    "。":dist({"我":.55,"你":.45})
+  };
+  // 草稿模型的“偏见”：偏爱 香蕉 和 我
+  var BIAS=dist({"我":.3,"香蕉":.3,"讨厌":.15,"吃":.1,"。":.1});
+  function $(id){return document.getElementById(id);}
+  function lam(){return +$("L").value/100;}
+  function q(prev){return Q[prev];}
+  function p(prev){ var l=lam(), a=Q[prev]; return a.map(function(x,i){return l*x+(1-l)*BIAS[i];}); }
+  function sample(d){ var r=Math.random(), c=0; for(var i=0;i<d.length;i++){ c+=d[i]; if(r<c) return i; } return d.length-1; }
+  function residual(qd,pd){ var r=qd.map(function(x,i){return Math.max(x-pd[i],0);}); var s=r.reduce(function(a,b){return a+b;},0); return s>0?r.map(function(x){return x/s;}):qd; }
+
+  var seq, nTarget, nDraft, nRounds, busy=false;
+  function reset(){ seq=[{w:"我",c:"t-ctx"}]; nTarget=0; nDraft=0; nRounds=0; $("rounds").innerHTML=""; renderSeq(); stats(); }
+  function renderSeq(){ $("seq").innerHTML=seq.map(function(t){return "<span class='tok "+t.c+"'>"+t.w+"</span>";}).join(""); }
+  function stats(){
+    var gen=seq.length-1, c=+$("C").value/100, k=+$("K").value;
+    var tSpec = nTarget*1 + nDraft*c, tBase = gen;
+    $("stats").innerHTML=
+      "<div class='stat'>已生成 token<b>"+gen+"</b></div>"+
+      "<div class='stat'>目标模型前向次数<b>"+nTarget+"</b></div>"+
+      "<div class='stat'>平均每次目标前向产出<b>"+(nTarget?(gen/nTarget).toFixed(2):"—")+" 个</b></div>"+
+      "<div class='stat'>估算加速比<b>"+(nTarget?(tBase/tSpec).toFixed(2)+"×":"—")+"</b></div>";
+  }
+  function fmt(x){return x.toFixed(2);}
+
+  // 一轮：草稿逐个猜 k 个 → 目标并行算 k+1 个位置的 q → 逐个接受/拒绝
+  function round(done){
+    if(busy) return; busy=true;
+    var k=+$("K").value, prev=seq[seq.length-1].w;
+    var drafts=[], ctx=prev;
+    for(var i=0;i<k;i++){ var pd=p(ctx), x=sample(pd); drafts.push({x:x,ctx:ctx,p:pd[x],pd:pd}); ctx=VOC[x]; }
+    nDraft+=k; nRounds++;
+    var box=document.createElement("div"); box.className="round";
+    box.innerHTML="<div style='font-size:12px;color:var(--muted);margin-bottom:4px'>第 "+nRounds+" 轮 · ① 草稿模型逐个猜 "+k+" 个 token（便宜，但要串行 "+k+" 次）</div><div class='row'></div><div class='chk'></div>";
+    var rows=$("rounds"); rows.insertBefore(box, rows.firstChild);
+    while(rows.children.length>3) rows.removeChild(rows.lastChild);
+    var rowEl=box.querySelector(".row"), chk=box.querySelector(".chk");
+    var chips=[];
+    var di=0;
+    (function addDraft(){
+      if(di<k){ var d=drafts[di]; var s=document.createElement("span"); s.className="tok t-draft"; s.innerHTML=VOC[d.x]+"<small>p="+fmt(d.p)+"</small>"; rowEl.appendChild(s); chips.push(s); di++; setTimeout(addDraft,250); return; }
+      chk.innerHTML="② 目标模型<b>一次前向</b>并行算出这 "+k+" 个位置（外加下一个位置）的 q。";
+      nTarget++;
+      setTimeout(verify,500);
+    })();
+    function verify(){
+      var j=0, lines=[];
+      (function next(){
+        if(j<k){
+          var d=drafts[j], qd=q(d.ctx), qx=qd[d.x], ratio=Math.min(1,qx/d.p), u=Math.random();
+          var acc=u<ratio;
+          chips[j].innerHTML=VOC[d.x]+"<small>q="+fmt(qx)+" / p="+fmt(d.p)+"</small>";
+          if(acc){
+            chips[j].className="tok t-ok"; seq.push({w:VOC[d.x],c:"t-ok"});
+            lines.push("“"+VOC[d.x]+"”：u="+fmt(u)+" < min(1, q/p)="+fmt(ratio)+" → 接受");
+            j++; chk.innerHTML=lines.join("<br>"); renderSeq(); setTimeout(next,350); return;
+          }
+          chips[j].className="tok t-bad";
+          var res=residual(qd,d.pd), y=sample(res);
+          lines.push("“"+VOC[d.x]+"”：u="+fmt(u)+" ≥ "+fmt(ratio)+" → 拒绝，从残差分布 max(q−p,0) 重抽得到“"+VOC[y]+"”，本轮结束");
+          var s=document.createElement("span"); s.className="tok t-fix"; s.textContent=VOC[y]; rowEl.appendChild(s);
+          for(var r=j+1;r<k;r++) chips[r].style.opacity=.3;
+          seq.push({w:VOC[y],c:"t-fix"});
+          finish(lines); return;
+        }
+        // 全部接受：用目标模型在第 k+1 个位置的分布再白送一个
+        var last=drafts[k-1], qd2=q(VOC[last.x]), z=sample(qd2);
+        var s2=document.createElement("span"); s2.className="tok t-bonus"; s2.textContent=VOC[z]; rowEl.appendChild(s2);
+        lines.push("全部接受！目标模型那次前向顺便给出了下一个位置的分布，再白送一个 token “"+VOC[z]+"”");
+        seq.push({w:VOC[z],c:"t-bonus"});
+        finish(lines);
+      })();
+    }
+    function finish(lines){ chk.innerHTML=lines.join("<br>"); renderSeq(); stats(); busy=false; if(done) setTimeout(done,450); }
+  }
+  $("bRound").onclick=function(){ if(seq.length-1>=30) reset(); round(); };
+  $("bAuto").onclick=function(){ if(busy) return; if(seq.length-1>=30) reset(); (function go(){ if(seq.length-1>=30) return; round(go); })(); };
+  $("bReset").onclick=function(){ if(!busy) reset(); };
+  ["K","L","C"].forEach(function(id){ $(id).addEventListener("input",function(){ $("vK").textContent=$("K").value; $("vL").textContent=lam().toFixed(2)+(lam()>0.95?"（几乎一样）":lam()<0.2?"（很不像）":""); $("vC").textContent=(+$("C").value)+"%"; stats(); }); });
+  $("vK").textContent=$("K").value; $("vL").textContent=lam().toFixed(2); $("vC").textContent=$("C").value+"%";
+
+  // ---- 蒙特卡洛验证 ----
+  function mc(){
+    var ctx="喜欢", qd=q(ctx), pd=p(ctx), cnt=new Array(V).fill(0), n=20000, acc=0;
+    for(var t=0;t<n;t++){ var x=sample(pd); if(Math.random()<Math.min(1,qd[x]/pd[x])){cnt[x]++;acc++;} else cnt[sample(residual(qd,pd))]++; }
+    var emp=cnt.map(function(c){return c/n;});
+    var tv=0; for(var i=0;i<V;i++) tv+=Math.abs(emp[i]-qd[i]); tv/=2;
+    $("mcInfo").textContent="接受率 "+(acc/n*100).toFixed(1)+"%；输出分布与 q 的总变差距离 = "+tv.toFixed(3)+"（抽样噪声量级约 0.01）";
+    drawMC(qd,pd,emp);
+  }
+  function drawMC(qd,pd,emp){
+    var s=$("mc"); while(s.firstChild) s.removeChild(s.firstChild);
+    var NS="http://www.w3.org/2000/svg";
+    function e(t,a){var x=document.createElementNS(NS,t);for(var k in a)x.setAttribute(k,a[k]);s.appendChild(x);return x;}
+    var L=20,R=690,B=185,T=10,gw=(R-L)/V,bw=gw/4.2, mx=Math.max.apply(null,qd.concat(pd).concat(emp||[]))*1.1;
+    e("line",{x1:L,y1:B,x2:R,y2:B,stroke:"var(--muted)"});
+    for(var i=0;i<V;i++){
+      var x0=L+i*gw+gw*0.12;
+      [[qd[i],"var(--q)"],[pd[i],"var(--p)"],[emp?emp[i]:0,"var(--emp)"]].forEach(function(v,j){ var h=v[0]/mx*(B-T); e("rect",{x:x0+j*bw,y:B-h,width:bw-2,height:h,fill:v[1],rx:2}); });
+      var t=e("text",{x:L+i*gw+gw/2,y:B+18,"text-anchor":"middle","font-size":"13",fill:"var(--fg)"}); t.textContent=VOC[i];
+    }
+  }
+  $("bMC").onclick=mc;
+  $("L").addEventListener("input",function(){ drawMC(q("喜欢"),p("喜欢"),null); $("mcInfo").textContent=""; });
+  drawMC(q("喜欢"),p("喜欢"),null);
+  reset();
+})();
+</script>
+</body>
+</html>

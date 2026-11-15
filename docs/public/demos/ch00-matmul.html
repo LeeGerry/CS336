@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>矩阵乘法逐元素</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#6b7280;--card:#f5f7fa;--border:#d8dee4;--accent:#2563eb;--accent-soft:#dbeafe;--warn:#d97706;--warn-soft:#fef3c7;--good:#059669;--good-soft:#d1fae5;--bad:#dc2626;--bad-soft:#fee2e2}
+@media (prefers-color-scheme: dark){:root{--bg:#16181d;--fg:#e6e8eb;--muted:#9aa3ae;--card:#1f232a;--border:#363c45;--accent:#60a5fa;--accent-soft:#1e3a5f;--warn:#fbbf24;--warn-soft:#4a3a12;--good:#34d399;--good-soft:#123a2c;--bad:#f87171;--bad-soft:#4c1d1d}}
+*{box-sizing:border-box}
+select{max-width:100%}
+label{max-width:100%}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+body{padding:12px;overflow-x:hidden}
+h3{margin:0 0 6px;font-size:16px}
+.muted{color:var(--muted);font-size:12.5px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin:8px 0}
+button,select{font:inherit;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg);cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button:disabled{opacity:.5;cursor:default}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
+.mats{display:flex;flex-wrap:wrap;gap:14px;align-items:flex-start;justify-content:center;margin:10px 0}
+.mat{display:inline-grid;gap:3px}
+.matwrap{text-align:center}
+.matwrap .cap{font-size:12.5px;color:var(--muted);margin-bottom:4px}
+.cell{width:34px;height:30px;display:flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:4px;background:var(--bg);font-family:ui-monospace,Menlo,monospace;font-size:13px;transition:background .2s}
+.cell.hl{background:var(--accent-soft);border-color:var(--accent)}
+.cell.hl2{background:var(--warn-soft);border-color:var(--warn)}
+.cell.done{background:var(--good-soft)}
+.cell.cur{background:var(--warn-soft);border-color:var(--warn);font-weight:700}
+.op{font-size:20px;align-self:center;color:var(--muted)}
+.err{background:var(--bad-soft);color:var(--bad);border:1px solid var(--bad);border-radius:8px;padding:8px;margin:8px 0}
+.calc{min-height:44px}
+@media (max-width:420px){.cell{width:28px;height:26px;font-size:12px}}
+</style>
+</head>
+<body>
+<h3>矩阵乘法：形状规则 + 逐元素计算</h3>
+<div class="muted">A 的形状 (m×k) 乘 B 的形状 (k×n) 得到 C (m×n)。C 的每个元素 = A 的一行 与 B 的一列 做点积。</div>
+
+<div class="row">
+  <label>A：m=<select id="m"></select> × k=<select id="k1"></select></label>
+  <label>B：k′=<select id="k2"></select> × n=<select id="n"></select></label>
+</div>
+<div class="row">
+  <button id="step" class="primary">单步（算一个元素）</button>
+  <button id="play">自动播放</button>
+  <button id="all">一次算完</button>
+  <button id="rand">换一组数</button>
+</div>
+
+<div id="err" class="err" style="display:none"></div>
+<div class="mats" id="mats"></div>
+
+<div class="card">
+  <div class="calc mono" id="calc">点“单步”开始。</div>
+  <div class="mono" id="flops" style="margin-top:6px"></div>
+</div>
+<div class="muted">在神经网络里：A 往往是一批输入 (batch, in)，B 是权重 (in, out)，C 就是输出 (batch, out)。“中间那个维度必须相等、并且被求和消掉”——这条规则请刻进脑子里。</div>
+
+<script>
+(function(){
+  var $=function(id){return document.getElementById(id);};
+  ['m','k1','k2','n'].forEach(function(id){ var s=$(id); for(var i=1;i<=5;i++){var o=document.createElement('option');o.value=i;o.textContent=i;s.appendChild(o);} });
+  $('m').value=2; $('k1').value=3; $('k2').value=3; $('n').value=2;
+  var A=[],B=[],C=[],pos=0,timer=null;
+  function rnd(){return Math.floor(Math.random()*7)-2;}
+  function build(){
+    stop();
+    var m=+$('m').value,k=+$('k1').value,k2=+$('k2').value,n=+$('n').value;
+    A=[];B=[];C=[];pos=0;
+    for(var i=0;i<m;i++){A.push([]);for(var j=0;j<k;j++)A[i].push(rnd());}
+    for(var i2=0;i2<k2;i2++){B.push([]);for(var j2=0;j2<n;j2++)B[i2].push(rnd());}
+    for(var i3=0;i3<m;i3++){C.push([]);for(var j3=0;j3<n;j3++)C[i3].push(null);}
+    render(-1,-1);
+  }
+  function ok(){return +$('k1').value===+$('k2').value;}
+  function matHTML(M,rows,cols,cls,name,shape){
+    var h='<div class="matwrap"><div class="cap">'+name+' <span class="mono">'+shape+'</span></div><div class="mat" style="grid-template-columns:repeat('+cols+',auto)">';
+    for(var i=0;i<rows;i++)for(var j=0;j<cols;j++){
+      var c=cls(i,j), v=M[i][j]; h+='<div class="cell '+c+'">'+(v===null?'?':v)+'</div>'; }
+    return h+'</div></div>';
+  }
+  function render(ci,cj){
+    var m=+$('m').value,k=+$('k1').value,k2=+$('k2').value,n=+$('n').value;
+    var e=$('err');
+    if(!ok()){
+      e.style.display='block';
+      e.innerHTML='形状不匹配：A 是 ('+m+'×'+k+')，B 是 ('+k2+'×'+n+')。A 的列数 k='+k+' 必须等于 B 的行数 k′='+k2+'，否则“一行”和“一列”长度不同，没法逐项相乘再相加。<br>PyTorch 会报错：<span class="mono">RuntimeError: mat1 and mat2 shapes cannot be multiplied ('+m+'x'+k+' and '+k2+'x'+n+')</span>';
+    } else e.style.display='none';
+    var h=matHTML(A,m,k,function(i){return i===ci?'hl':'';},'A','('+m+'×'+k+')');
+    h+='<div class="op">×</div>';
+    h+=matHTML(B,k2,n,function(i,j){return j===cj?'hl2':'';},'B','('+k2+'×'+n+')');
+    if(ok()){
+      h+='<div class="op">=</div>';
+      h+=matHTML(C,m,n,function(i,j){return (i===ci&&j===cj)?'cur':(C[i][j]!==null?'done':'');},'C','('+m+'×'+n+')');
+    }
+    $('mats').innerHTML=h;
+    var total=m*n, done=0; for(var a=0;a<m;a++)for(var b=0;b<n;b++) if(C[a][b]!==null) done++;
+    if(ok()) $('flops').textContent='已算 '+done+'/'+total+' 个元素；每个元素需 '+k+' 次乘法 + '+(k-1)+' 次加法 ≈ 2k = '+(2*k)+' 次浮点运算；整个乘法 ≈ 2·m·k·n = 2×'+m+'×'+k+'×'+n+' = '+(2*m*k*n)+' FLOPs';
+    else $('flops').textContent='';
+    ['step','play','all'].forEach(function(id){$(id).disabled=!ok()||done===total;});
+  }
+  function stepOnce(){
+    if(!ok()) return;
+    var m=+$('m').value,n=+$('n').value,k=+$('k1').value;
+    if(pos>=m*n){stop();return;}
+    var i=Math.floor(pos/n), j=pos%n, s=0, parts=[];
+    for(var t=0;t<k;t++){s+=A[i][t]*B[t][j]; parts.push('('+A[i][t]+')×('+B[t][j]+')');}
+    C[i][j]=s; pos++;
+    $('calc').innerHTML='C['+i+']['+j+'] = A 第 '+i+' 行 · B 第 '+j+' 列 = '+parts.join(' + ')+' = <b>'+s+'</b>';
+    render(i,j);
+    if(pos>=m*n) stop();
+  }
+  function stop(){ if(timer){clearInterval(timer);timer=null;} $('play').textContent='自动播放'; }
+  $('step').onclick=stepOnce;
+  $('play').onclick=function(){ if(timer){stop();return;} this.textContent='暂停'; stepOnce(); timer=setInterval(stepOnce,900); };
+  $('all').onclick=function(){ stop(); var m=+$('m').value,n=+$('n').value; while(pos<m*n) stepOnce(); $('calc').innerHTML+='<br>（全部算完。）'; };
+  $('rand').onclick=function(){ build(); $('calc').textContent='点“单步”开始。'; };
+  ['m','k1','k2','n'].forEach(function(id){ $(id).onchange=function(){ build(); $('calc').textContent='点“单步”开始。'; }; });
+  build();
+})();
+</script>
+</body>
+</html>

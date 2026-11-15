@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>并行切分与显存</title>
+<style>
+:root{ --bg:#ffffff; --panel:#f5f6f8; --fg:#1d2330; --muted:#667085; --line:#d0d5dd; --accent:#2563eb; --track:#e5e7eb;
+  --p:#2563eb; --g:#ea580c; --o:#16a34a; --a:#dc2626; --empty:#e5e7eb; --bad:#dc2626; --good:#16a34a; }
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#111418; --panel:#1b2027; --fg:#e6e9ef; --muted:#98a2b3; --line:#344054; --accent:#60a5fa; --track:#2a313c;
+    --p:#3b82f6; --g:#f97316; --o:#22c55e; --a:#ef4444; --empty:#2a313c; --bad:#f87171; --good:#4ade80; }
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;font-size:14px}
+.wrap{max-width:760px;margin:0 auto;padding:12px}
+h1{font-size:16px;margin:0 0 8px}
+.tabs{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px}
+button{font:inherit;border:1px solid var(--line);background:var(--panel);color:var(--fg);padding:5px 9px;border-radius:6px;cursor:pointer}
+button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px 12px}
+@media (max-width:560px){ .grid{grid-template-columns:1fr 1fr} }
+label{display:block;font-size:12px;color:var(--muted);margin-bottom:2px}
+label b{color:var(--fg)}
+select,input[type=range]{width:100%}
+select{font:inherit;font-size:13px;padding:3px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--fg)}
+.chk{font-size:12.5px;color:var(--fg);display:flex;gap:6px;align-items:center}
+.card{background:var(--panel);border-radius:10px;padding:10px;margin-top:10px}
+.gpus{display:grid;gap:8px}
+.gpu{border:1px solid var(--line);border-radius:8px;padding:6px;background:var(--bg)}
+.gpu h3{margin:0 0 4px;font-size:12px;font-weight:600;display:flex;justify-content:space-between}
+.mini{display:grid;gap:1px;margin-bottom:4px}
+.mini div{aspect-ratio:1;border-radius:2px;background:var(--empty)}
+.mini div.on{background:var(--p)}
+.mini div.tmp{background:transparent;outline:1.5px dashed var(--p);outline-offset:-2px}
+.strip{display:grid;gap:1px;margin:2px 0}
+.strip div{height:7px;border-radius:2px;background:var(--empty)}
+.cap{font-size:10.5px;color:var(--muted);margin-top:2px}
+.bar{height:96px;background:var(--track);border-radius:5px;position:relative;overflow:hidden;margin-top:5px}
+.seg{position:absolute;left:0;right:0}
+.limit{position:absolute;left:0;right:0;border-top:2px dashed var(--fg);opacity:.6}
+.mem{font-size:11.5px;text-align:center;margin-top:3px;font-weight:600}
+.legend{display:flex;flex-wrap:wrap;gap:10px;font-size:12px;color:var(--muted);margin:4px 0}
+.legend span::before{content:"";display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px;background:var(--c)}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+td{padding:3px 4px;border-bottom:1px solid var(--line)}
+td:last-child{text-align:right;font-variant-numeric:tabular-nums}
+.desc{font-size:13px;line-height:1.65}
+.muted{color:var(--muted);font-size:12px;line-height:1.6}
+.ok{color:var(--good);font-weight:700}.no{color:var(--bad);font-weight:700}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>同样 N 张卡，六种切法：每张卡上放了什么、要多少显存？</h1>
+  <div class="tabs" id="tabs"></div>
+  <div class="grid">
+    <div><label>模型（≈12·L·h² 参数）</label><select id="model"></select></div>
+    <div><label>GPU 数 N：<b id="vN"></b></label><input id="N" type="range" min="1" max="6" value="3"></div>
+    <div><label>单卡显存</label><select id="capSel"><option value="80">80 GB（A100/H100）</option><option value="141">141 GB（H200）</option><option value="192">192 GB（B200）</option></select></div>
+    <div><label>每参数字节（训练状态）</label><select id="bpp"><option value="16">16 字节：bf16 参数/梯度 + fp32 主权重/Adam</option><option value="12">12 字节：仅主权重 fp32，其余 bf16</option></select></div>
+    <div><label>序列长度 s：<b id="vS"></b></label><input id="S" type="range" min="9" max="15" value="12"></div>
+    <div><label>每卡微批大小 b：<b id="vB"></b></label><input id="B" type="range" min="0" max="5" value="0"></div>
+  </div>
+  <div class="row" style="display:flex;flex-wrap:wrap;gap:14px;margin-top:6px">
+    <label class="chk"><input type="checkbox" id="flash" checked> FlashAttention / 重计算注意力（去掉 5as/h 项）</label>
+    <label class="chk" id="spWrap"><input type="checkbox" id="sp"> 张量并行时同时开序列并行（SP）</label>
+  </div>
+  <div class="card desc" id="desc"></div>
+  <div class="card">
+    <div class="legend"><span style="--c:var(--p)">参数</span><span style="--c:var(--g)">梯度</span><span style="--c:var(--o)">优化器状态</span><span style="--c:var(--a)">激活值</span><span>虚线 = 单卡显存上限</span></div>
+    <div class="muted" style="margin-bottom:6px">每张卡上方的小方格 = 整个模型（行 = 层，列 = 宽度切块），实心 = 这张卡长期持有的参数，虚线框 = 计算时才临时 all-gather 过来、用完即丢。下方两条 = 梯度和优化器状态里本卡持有的部分。</div>
+    <div class="gpus" id="gpus"></div>
+  </div>
+  <div class="card"><table id="tbl"></table></div>
+  <div class="card muted" id="foot"></div>
+</div>
+<script>
+(function(){
+  var MODELS=[{n:"≈7B（L=32, h=4096, a=32）",L:32,h:4096,a:32},{n:"≈13B（L=40, h=5120, a=40）",L:40,h:5120,a:40},
+              {n:"≈65B（L=80, h=8192, a=64）",L:80,h:8192,a:64},{n:"≈175B（L=96, h=12288, a=96）",L:96,h:12288,a:96}];
+  var STRATS=[
+    {k:"ddp",n:"DDP 朴素数据并行"},{k:"z1",n:"ZeRO-1"},{k:"z2",n:"ZeRO-2"},{k:"z3",n:"ZeRO-3 / FSDP"},
+    {k:"tp",n:"张量并行 TP"},{k:"pp",n:"流水线并行 PP"}];
+  var cur="z3";
+  function $(id){return document.getElementById(id);}
+  MODELS.forEach(function(m,i){var o=document.createElement("option");o.value=i;o.textContent=m.n;$("model").appendChild(o);});
+  STRATS.forEach(function(s){var b=document.createElement("button");b.textContent=s.n;b.dataset.k=s.k;b.onclick=function(){cur=s.k;update();};$("tabs").appendChild(b);});
+  function GB(x){return x/1e9;}
+  function fmt(x){ x=GB(x); return x>=100?x.toFixed(0):x>=10?x.toFixed(1):x.toFixed(2); }
+
+  function update(){
+    var m=MODELS[+$("model").value], N=Math.pow(2,+$("N").value), cap=+$("capSel").value*1e9;
+    var bpp=+$("bpp").value, s=Math.pow(2,+$("S").value), b=Math.pow(2,+$("B").value);
+    var flash=$("flash").checked, sp=$("sp").checked;
+    $("vN").textContent=N; $("vS").textContent=s; $("vB").textContent=b;
+    $("spWrap").style.display = cur==="tp"?"flex":"none";
+    var bs=document.querySelectorAll("#tabs button"); for(var i=0;i<bs.length;i++) bs[i].className=bs[i].dataset.k===cur?"on":"";
+    var P=12*m.L*m.h*m.h;
+    var K=bpp-4;               // 优化器状态（主权重 + Adam 两个矩）每参数字节
+    var L=m.L,h=m.h,a=m.a;
+    // 激活：每层 s·b·h·(34 + 5·a·s/h) 字节（Korthikanti et al. 2022）
+    var attn = flash?0:5*a*s/h;
+    var actLayerFull = s*b*h*(34+attn);
+    var pB=2*P, gB=2*P, oB=K*P, act=actLayerFull*L, desc="", comm="";
+    var pFrac=1,gFrac=1,oFrac=1, view="all";
+    if(cur==="ddp"){ desc="每张卡都有<b>完整</b>的参数、梯度、优化器状态，只是看的数据不同（数据切成 N 份）。反向后用一次 all-reduce 平均梯度。显存<b>完全不随 N 下降</b>。";
+      comm="每步一次 all-reduce（梯度）≈ 2 × 参数量"; }
+    if(cur==="z1"){ oFrac=1/N; desc="ZeRO-1：只把<b>优化器状态</b>切成 N 份。每张卡仍算完整梯度，然后 reduce-scatter 把梯度的第 i 段汇总到卡 i，卡 i 只更新自己那 1/N 参数，再 all-gather 把新参数发回给大家。";
+      comm="reduce-scatter（梯度）+ all-gather（参数）≈ 2 × 参数量，与 DDP 相同 → 省显存“免费”"; }
+    if(cur==="z2"){ oFrac=1/N; gFrac=1/N; desc="ZeRO-2：梯度也切分。反向时每算完一层的梯度，立刻 reduce 发给负责它的卡，然后马上释放，从不在一张卡上攒出完整梯度。";
+      comm="仍 ≈ 2 × 参数量（只是分层逐步发送），几乎免费"; }
+    if(cur==="z3"){ oFrac=1/N; gFrac=1/N; pFrac=1/N; view="z3"; desc="ZeRO-3 / FSDP：参数也切分，每卡长期只存 1/N。算某一层前 all-gather 该层完整参数（虚线框），算完立刻丢掉；反向时再 all-gather 一次，算出梯度后 reduce-scatter 出去。靠“边算下一层边取参数”的重叠把通信藏起来。";
+      comm="2 次 all-gather + 1 次 reduce-scatter ≈ 3 × 参数量（DDP 的 1.5 倍）"; }
+    if(cur==="tp"){ oFrac=1/N; gFrac=1/N; pFrac=1/N; view="tp";
+      act = sp ? actLayerFull*L/N : s*b*h*(10+24/N+(flash?0:5*a*s/(h*N)))*L;
+      desc="张量并行：每一层的矩阵按列/行切成 N 份，每卡永久持有每层的 1/N，从不聚齐参数；每层算完要用 all-reduce 交换<b>激活值</b>。所有卡处理同一批数据。"+(sp?"开启序列并行后，LayerNorm/Dropout 这类逐点操作的激活也按序列切开，激活显存完全按 1/N 下降。":"注意：LayerNorm、Dropout、各层输入这 10·sbh 的激活<b>不会</b>被切分（勾选上面的 SP 试试）。");
+      comm="每层前向/反向各一次激活 all-reduce，约 8·b·s·h·(N−1)/N 字节每层；通信极频繁 → 只在节点内（≤8 卡）用"; }
+    if(cur==="pp"){ oFrac=1/N; gFrac=1/N; pFrac=1/N; view="pp";
+      act = actLayerFull*(L/N)*N;
+      desc="流水线并行：按层切，卡 i 持有第 i 段的连续几层。数据切成微批次依次流过各段，相邻段之间点对点传激活。1F1B 调度下，第 i 段最多同时保存 N−i 个微批次的激活：第一段要存 N 个微批 × L/N 层 ≈ 整个模型一个微批的激活，<b>并不随 N 下降</b>；越靠后的段越省。";
+      comm="每个微批在每个段边界点对点传一次激活 b·s·h；通信最省，适合跨节点慢速链路，但有“气泡”"; }
+    var mine={p:pB*pFrac,g:gB*gFrac,o:oB*oFrac,a:act};
+    var tot=mine.p+mine.g+mine.o+mine.a;
+    $("desc").innerHTML=desc+"<br><span class='muted'>通信：</span>"+comm;
+    // GPU 卡片
+    var show=Math.min(N,8), C=Math.min(N,8), R=Math.min(N,8), host=$("gpus"); host.innerHTML=""; host.style.gridTemplateColumns="repeat("+(show<=4?show:4)+",minmax(0,1fr))";
+    if (C<4){ C=4; R=4; }
+    var maxScale=Math.max(cap*1.15, tot*1.05);
+    for(var g=0; g<show; g++){
+      var d=document.createElement("div"); d.className="gpu";
+      var idx = (N>8 && g===7) ? N-1 : g;
+      var dataLabel = (cur==="tp"||cur==="pp") ? "同一批数据" : "数据 "+idx;
+      var html="<h3><span>GPU "+idx+"</span></h3><div class='mini' style='grid-template-columns:repeat("+C+",1fr)'>";
+      for(var r=0;r<R;r++) for(var c=0;c<C;c++){
+        var own = cellOwner(view,r,c,R,C,N);
+        var cls="";
+        if(view==="all") cls="on";
+        else if(own===idx) cls="on";
+        else if(view==="z3") cls="tmp";
+        html+="<div class='"+cls+"'></div>";
+      }
+      html+="</div>";
+      html+=strip("var(--g)",gFrac,idx,N,C)+strip("var(--o)",oFrac,idx,N,C);
+      html+="<div class='cap'>"+dataLabel+"</div>";
+      var mg={p:mine.p,g:mine.g,o:mine.o,a:(cur==="pp"? actLayerFull*(L/N)*(N-idx) : mine.a)}; var tg=mg.p+mg.g+mg.o+mg.a;
+      var bar="<div class='bar'>", y=0;
+      [["a","var(--a)"],["o","var(--o)"],["g","var(--g)"],["p","var(--p)"]].forEach(function(x){ var hgt=mg[x[0]]/maxScale*100; bar+="<div class='seg' style='bottom:"+y+"%;height:"+hgt+"%;background:"+x[1]+"'></div>"; y+=hgt; });
+      bar+="<div class='limit' style='bottom:"+(cap/maxScale*100)+"%'></div></div>";
+      html+=bar+"<div class='mem "+(tg<=cap?"ok":"no")+"'>"+fmt(tg)+" GB</div>";
+      if (N>8 && g===6) html="<h3><span>…</span></h3><div class='cap' style='text-align:center;margin-top:40px'>中间还有 "+(N-8)+" 张卡，情况相同</div>";
+      d.innerHTML=html; host.appendChild(d);
+    }
+    // 表格
+    var maxP = maxParams(cur,N,cap,bpp,K);
+    $("tbl").innerHTML=
+      row("参数量 Ψ", (P/1e9).toFixed(1)+" B")+
+      row("每卡：参数", fmt(mine.p)+" GB")+row("每卡：梯度", fmt(mine.g)+" GB")+row("每卡：优化器状态", fmt(mine.o)+" GB")+
+      row("每卡：激活值（"+(cur==="pp"?"第一段，1F1B":"一个微批")+"）", fmt(mine.a)+" GB")+
+      row("<b>每卡合计</b>", "<b class='"+(tot<=cap?"ok":"no")+"'>"+fmt(tot)+" GB "+(tot<=cap?"✓ 放得下":"✗ 放不下")+"</b>")+
+      row("忽略激活时，这种切法最多能放的模型", maxP);
+    $("foot").innerHTML="公式：参数 2Ψ、梯度 2Ψ、优化器 KΨ（16 字节方案 K=12，12 字节方案 K=8）。激活每层 s·b·h·(34+5·a·s/h) 字节，来自 Korthikanti 等 2022；TP 不开 SP 时为 s·b·h·(10+24/N+5·a·s/(h·N))，开 SP 时整体 ÷N。"+
+      "<br>想复现讲义表格？选 80 GB、12 字节、N=8，再点 DDP / ZeRO-1 / ZeRO-2 / ZeRO-3，看最后一行：约 6.7B / 16B / 24.6B / 53.3B。"+
+      "<br>简化：忽略 embedding、临时缓冲、通信缓冲和显存碎片；实际可用显存会更少。";
+  }
+  function cellOwner(view,r,c,R,C,N){
+    if(view==="pp") return Math.floor(r*N/R) % N;     // 按层（行）切
+    return Math.floor(c*N/C) % N;                      // 按宽度（列）切：TP / FSDP 每层的 1/N
+  }
+  function strip(color,frac,idx,N,C){
+    var s="<div class='strip' style='grid-template-columns:repeat("+C+",1fr)'>";
+    for(var c=0;c<C;c++){ var on = frac===1 || Math.floor(c*N/C)%N===idx; s+="<div style='background:"+(on?color:"var(--empty)")+"'></div>"; }
+    return s+"</div>";
+  }
+  function row(a,b){return "<tr><td>"+a+"</td><td>"+b+"</td></tr>";}
+  function maxParams(k,N,cap,bpp,K){
+    var per = k==="ddp"?bpp : k==="z1"?(4+K/N) : k==="z2"?(2+(2+K)/N) : bpp/N;
+    var lab = k==="ddp"?bpp+" 字节/参数" : k==="z1"?"(4+"+K+"/N) 字节/参数" : k==="z2"?"(2+"+(2+K)+"/N) 字节/参数" : bpp+"/N 字节/参数";
+    return (cap/per/1e9).toFixed(1)+" B（"+lab+"）";
+  }
+  ["model","N","capSel","bpp","S","B","flash","sp"].forEach(function(id){$(id).addEventListener("input",update);$(id).addEventListener("change",update);});
+  update();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>矩阵乘法分块 Tiling</title>
+<style>
+:root{
+  --bg:#ffffff; --fg:#1f2328; --muted:#656d76; --card:#f6f8fa; --border:#d0d7de;
+  --a:#3b6fd8; --b:#c77d00; --c:#2e7d32; --hl:#d1495b; --accent:#3b6fd8; --cell:#eef1f4;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#16181d; --fg:#e6e8eb; --muted:#9aa4b2; --card:#20242b; --border:#363c46;
+    --a:#7aa2ff; --b:#ffb84d; --c:#6fd17a; --hl:#ff7a85; --accent:#7aa2ff; --cell:#262b33;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+h1{font-size:16px;margin:0 0 8px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+button,select{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 10px;cursor:pointer}
+canvas{width:100%;max-width:520px;display:block;margin:0 auto;border-radius:8px;background:var(--card);border:1px solid var(--border)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-top:8px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:6px 10px}
+.card b{display:block;font-size:16px}
+.small{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<h1>分块矩阵乘法：一块搬进共享内存，反复使用</h1>
+<div class="row">
+  <label>矩阵边长 N</label><select id="N"><option>8</option><option selected>12</option><option>16</option></select>
+  <label>分块边长 T</label><select id="T"></select>
+  <label>速度</label><select id="spd"><option value="600">慢</option><option value="250" selected>中</option><option value="60">快</option></select>
+</div>
+<div class="row">
+  <button id="play">▶ 播放</button><button id="step">单步（一个阶段）</button><button id="fin">跳到结束</button><button id="reset">重置</button>
+</div>
+<canvas id="cv"></canvas>
+<p id="msg" style="margin:6px 0"></p>
+<div class="stats">
+  <div class="card"><span class="small">已从 HBM 读取的元素</span><b id="s1">0</b></div>
+  <div class="card"><span class="small">全部完成时总读取</span><b id="s2"></b></div>
+  <div class="card"><span class="small">不分块（T=1）总读取</span><b id="s3"></b></div>
+  <div class="card"><span class="small">共享内存占用（元素）</span><b id="s4"></b></div>
+</div>
+<p class="small">格子里的数字 = 该元素到目前为止被从 HBM 读了几次。不分块时每个输入元素要读 N 次；分块边长为 T 时只需读 N/T 次（块内再用 T 次）。总读取量 2N³/T，减少到 1/T。代价：共享内存要同时放下 A 块、B 块与 C 累加块，约 3T² 个元素，所以 T 不能无限大。</p>
+<script>
+(function(){
+const $=id=>document.getElementById(id);
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+let N,T,nt,steps,si,cntA,cntB,cDone,cur,playing=false,timer=null;
+function fillT(){ const n=+$('N').value, sel=$('T'), old=+sel.value||0; sel.innerHTML='';
+  [1,2,3,4,6,8].filter(t=>n%t===0).forEach(t=>{const o=document.createElement('option');o.value=t;o.textContent=t+(t===1?'（不分块）':'');sel.appendChild(o);});
+  const opts=[...sel.options].map(o=>+o.value); sel.value= opts.includes(old)?old:(opts.includes(4)?4:opts[opts.length-1]); }
+function build(){
+  stop(); N=+$('N').value; T=+$('T').value; nt=N/T; steps=[];
+  for(let i=0;i<nt;i++) for(let j=0;j<nt;j++) for(let p=0;p<nt;p++) steps.push({i,j,p});
+  si=0; cntA=Array.from({length:N},()=>Array(N).fill(0)); cntB=Array.from({length:N},()=>Array(N).fill(0));
+  cDone=Array.from({length:nt},()=>Array(nt).fill(0)); cur=null;
+  $('s2').textContent=(2*N*N*N/T).toLocaleString(); $('s3').textContent=(2*N*N*N).toLocaleString();
+  $('s4').textContent=(3*T*T)+'（A、B、C 各 '+T*T+'）';
+  update(); draw();
+}
+function doStep(){
+  if(si>=steps.length) return false;
+  const s=steps[si++]; cur=s;
+  for(let r=0;r<T;r++) for(let c=0;c<T;c++){ cntA[s.i*T+r][s.p*T+c]++; cntB[s.p*T+r][s.j*T+c]++; }
+  cDone[s.i][s.j]=s.p+1;
+  return true;
+}
+function loaded(){ let t=0; for(let r=0;r<N;r++) for(let c=0;c<N;c++) t+=cntA[r][c]+cntB[r][c]; return t; }
+function update(){
+  $('s1').textContent=loaded().toLocaleString();
+  if(!cur){ $('msg').textContent='共 '+nt*nt+' 个输出块，每个块要经过 '+nt+' 个阶段（沿 K 方向）。点击“单步”开始。'; return; }
+  const s=cur;
+  $('msg').innerHTML= si>=steps.length ? '完成！C 的每个块都写回 HBM（每个只写一次）。'
+    : '输出块 C['+s.i+','+s.j+']，阶段 '+(s.p+1)+'/'+nt+'：把 <b style="color:var(--a)">A['+s.i+','+s.p+']</b> 和 <b style="color:var(--b)">B['+s.p+','+s.j+']</b> 从 HBM 搬进共享内存，做一次 '+T+'×'+T+' 小矩阵乘，累加到 C 块。'+(s.p+1===nt?' 该块累加完毕，写回 HBM。':'');
+}
+function draw(){
+  const cv=$('cv'), ctx=cv.getContext('2d'), dpr=window.devicePixelRatio||1, W=cv.clientWidth;
+  const gap=14, pad=22, cs=Math.floor((W-pad-gap-8)/(2*N)), H=pad+2*N*cs+gap+8;
+  cv.style.height=H+'px'; cv.width=W*dpr; cv.height=H*dpr; ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H);
+  const ax=pad-8, ay=pad+N*cs+gap, bx=ax+N*cs+gap, by=pad, cx=bx, cy=ay;
+  ctx.font='12px sans-serif'; ctx.fillStyle=css('--muted'); ctx.textAlign='left';
+  ctx.fillText('B（K×N）', bx, by-6); ctx.fillText('A（M×K）', ax, ay-4); ctx.fillText('C = A·B', cx, cy-4);
+  let maxc=1; for(let r=0;r<N;r++) for(let c=0;c<N;c++) maxc=Math.max(maxc,cntA[r][c],cntB[r][c]);
+  function grid(x0,y0,cnt,col,hi){
+    for(let r=0;r<N;r++) for(let c=0;c<N;c++){
+      const v=cnt?cnt[r][c]:0; ctx.fillStyle=css('--cell'); ctx.fillRect(x0+c*cs,y0+r*cs,cs-1,cs-1);
+      if(v){ ctx.globalAlpha=0.15+0.75*v/Math.max(N,maxc); ctx.fillStyle=css(col); ctx.fillRect(x0+c*cs,y0+r*cs,cs-1,cs-1); ctx.globalAlpha=1; }
+      if(cnt && cs>=16){ ctx.fillStyle=css('--fg'); ctx.textAlign='center'; ctx.font=Math.min(11,cs*0.55)+'px sans-serif'; ctx.fillText(v,x0+c*cs+cs/2-0.5,y0+r*cs+cs*0.68); }
+    }
+    if(hi){ ctx.strokeStyle=css('--hl'); ctx.lineWidth=2.5; ctx.strokeRect(x0+hi[1]*T*cs-1,y0+hi[0]*T*cs-1,T*cs+1,T*cs+1); }
+    // 块边界
+    ctx.strokeStyle=css('--border'); ctx.lineWidth=1;
+    for(let k=0;k<=nt;k++){ ctx.beginPath(); ctx.moveTo(x0+k*T*cs-0.5,y0); ctx.lineTo(x0+k*T*cs-0.5,y0+N*cs); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x0,y0+k*T*cs-0.5); ctx.lineTo(x0+N*cs,y0+k*T*cs-0.5); ctx.stroke(); }
+  }
+  grid(ax,ay,cntA,'--a',cur&&si<=steps.length?[cur.i,cur.p]:null);
+  grid(bx,by,cntB,'--b',cur?[cur.p,cur.j]:null);
+  // C
+  for(let i=0;i<nt;i++) for(let j=0;j<nt;j++){
+    const d=cDone[i][j]; ctx.fillStyle=css('--cell'); ctx.fillRect(cx+j*T*cs,cy+i*T*cs,T*cs-1,T*cs-1);
+    if(d){ ctx.globalAlpha=0.2+0.7*d/nt; ctx.fillStyle=css('--c'); ctx.fillRect(cx+j*T*cs,cy+i*T*cs,T*cs-1,T*cs-1); ctx.globalAlpha=1; }
+  }
+  if(cur){ ctx.strokeStyle=css('--hl'); ctx.lineWidth=2.5; ctx.strokeRect(cx+cur.j*T*cs-1,cy+cur.i*T*cs-1,T*cs+1,T*cs+1); }
+}
+function stop(){ playing=false; if(timer){clearTimeout(timer);timer=null;} $('play').textContent='▶ 播放'; }
+function tick(){ if(!playing) return; if(!doStep()){ stop(); update(); draw(); return; } update(); draw(); timer=setTimeout(tick, +$('spd').value); }
+$('play').onclick=()=>{ if(playing){stop();return;} if(si>=steps.length) build(); playing=true; $('play').textContent='⏸ 暂停'; tick(); };
+$('step').onclick=()=>{ stop(); doStep(); update(); draw(); };
+$('fin').onclick=()=>{ stop(); while(doStep()); update(); draw(); };
+$('reset').onclick=build;
+$('N').onchange=()=>{ fillT(); build(); };
+$('T').onchange=build;
+window.addEventListener('resize',draw);
+fillT(); build();
+})();
+</script>
+</body>
+</html>

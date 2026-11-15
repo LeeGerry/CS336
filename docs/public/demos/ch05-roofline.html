@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roofline 屋顶线模型</title>
+<style>
+:root{
+  --bg:#ffffff; --fg:#1f2328; --muted:#656d76; --card:#f6f8fa; --border:#d0d7de;
+  --mem:#d1495b; --comp:#2e7d32; --accent:#3b6fd8; --grid:#e6e9ed; --faint:#b8c0ca;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#16181d; --fg:#e6e8eb; --muted:#9aa4b2; --card:#20242b; --border:#363c46;
+    --mem:#ff7a85; --comp:#6fd17a; --accent:#7aa2ff; --grid:#2a2f37; --faint:#4b5360;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+h1{font-size:16px;margin:0 0 8px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:8px 10px}
+label{color:var(--muted)}
+select,button{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 8px}
+button{cursor:pointer}
+button.on{border-color:var(--accent);color:var(--accent);font-weight:600}
+input[type=range]{width:100%}
+canvas{width:100%;display:block;border-radius:8px;background:var(--card);border:1px solid var(--border)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:8px}
+.stat b{display:block;font-size:16px}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-weight:700;color:#fff}
+.small{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<h1>Roofline：算术强度决定你是“内存受限”还是“计算受限”</h1>
+
+<div class="row">
+  <label>GPU：</label>
+  <select id="gpu">
+    <option value="A100">A100</option>
+    <option value="H100" selected>H100</option>
+    <option value="B200">B200</option>
+  </select>
+  <label>精度：</label>
+  <select id="prec">
+    <option value="bf16" selected>BF16（Tensor Core）</option>
+    <option value="fp32">FP32</option>
+  </select>
+</div>
+
+<div class="row" id="presets"></div>
+
+<div class="card">
+  <div class="row" style="justify-content:space-between;margin:0">
+    <span>算术强度 = FLOPs ÷ 搬运字节数：<b id="aiTxt"></b> FLOP/字节</span>
+  </div>
+  <input id="ai" type="range" min="-1.5" max="4" step="0.01" value="0">
+  <div class="row" id="nRow" style="margin:0;display:none">
+    <span style="white-space:nowrap">方阵边长 n = <b id="nTxt"></b></span>
+    <input id="n" type="range" min="4" max="14" step="1" value="10">
+  </div>
+</div>
+
+<canvas id="cv" height="320"></canvas>
+
+<div class="stats">
+  <div class="card stat"><span class="small">峰值算力</span><b id="sPeak"></b></div>
+  <div class="card stat"><span class="small">HBM 带宽</span><b id="sBw"></b></div>
+  <div class="card stat"><span class="small">拐点（加速器强度）</span><b id="sRidge"></b></div>
+  <div class="card stat"><span class="small">可达算力 / 峰值</span><b id="sUtil"></b></div>
+</div>
+<p id="verdict" style="margin:8px 0 0"></p>
+<p class="small">规格取自课程讲义（Lecture 2 / Lecture 6）：BF16 为不含稀疏的稠密峰值。A100 312 TFLOP/s · 2 TB/s；H100 989.5 TFLOP/s · 3.35 TB/s；B200 2250 TFLOP/s · 8 TB/s。FP32 峰值分别为 19.5 / 67.5 / 75 TFLOP/s。实际可达性能会更低。</p>
+
+<script>
+(function(){
+const GPUS = {
+  A100:{bf16:312e12, fp32:19.5e12, bw:2.0e12},
+  H100:{bf16:989.5e12, fp32:67.5e12, bw:3.35e12},
+  B200:{bf16:2250e12, fp32:75e12, bw:8e12}
+};
+// 每个预设：给出 bf16 下的算术强度；fp32 字节翻倍 => 强度减半
+const PRESETS = [
+  {id:'relu', name:'ReLU', ai:()=>0.25, note:'读 x、写 y，每元素 1 次比较：n / 4n 字节'},
+  {id:'dot', name:'向量点积', ai:()=>0.5, note:'2n FLOPs / 4n 字节'},
+  {id:'matvec', name:'矩阵×向量', ai:()=>1, note:'约 2n² FLOPs / 2n² 字节，推理 decode 的典型形态'},
+  {id:'gelu', name:'GeLU', ai:()=>5, note:'按约 20 FLOPs/元素估算，仍然内存受限'},
+  {id:'matmul', name:'矩阵×矩阵', ai:(n)=>n/3, note:'约 2n³ FLOPs / 6n² 字节 ≈ n/3'},
+  {id:'free', name:'自由拖动', ai:null, note:''}
+];
+const $ = id=>document.getElementById(id);
+let current = 'free';
+const pBox = $('presets');
+PRESETS.forEach(p=>{
+  const b=document.createElement('button'); b.textContent=p.name; b.dataset.id=p.id;
+  b.onclick=()=>{current=p.id; applyPreset(); draw();};
+  pBox.appendChild(b);
+});
+function bytesFactor(){ return $('prec').value==='fp32'?2:1; }
+function applyPreset(){
+  [...pBox.children].forEach(b=>b.classList.toggle('on', b.dataset.id===current));
+  const p = PRESETS.find(x=>x.id===current);
+  $('nRow').style.display = current==='matmul'?'flex':'none';
+  if(p.ai){
+    const n = Math.pow(2, +$('n').value);
+    const ai = p.ai(n)/bytesFactor();
+    $('ai').value = Math.log10(ai);
+  }
+}
+function fmtF(x){
+  if(x>=1e15) return (x/1e15).toFixed(2)+' PFLOP/s';
+  if(x>=1e12) return (x/1e12).toFixed(1)+' TFLOP/s';
+  return (x/1e9).toFixed(1)+' GFLOP/s';
+}
+function fmtAI(x){ return x>=100? x.toFixed(0) : x>=1? x.toFixed(2): x.toFixed(3); }
+const cv=$('cv'), ctx=cv.getContext('2d');
+const css = n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+function draw(){
+  const dpr=window.devicePixelRatio||1, W=cv.clientWidth, H=Math.max(240, Math.min(360, W*0.55));
+  cv.style.height=H+'px'; cv.width=W*dpr; cv.height=H*dpr; ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,W,H);
+  const prec=$('prec').value, g=GPUS[$('gpu').value];
+  const peak=g[prec], bw=g.bw, ridge=peak/bw;
+  const ai=Math.pow(10, +$('ai').value);
+  const L=52, R=12, T=14, B=36, pw=W-L-R, ph=H-T-B;
+  const x0=-1.5, x1=4, y0=10.5, y1=15.6; // log10
+  const X=v=>L+(Math.log10(v)-x0)/(x1-x0)*pw;
+  const Y=v=>T+ph-(Math.log10(v)-y0)/(y1-y0)*ph;
+  // 网格
+  ctx.strokeStyle=css('--grid'); ctx.fillStyle=css('--muted'); ctx.lineWidth=1; ctx.font='11px sans-serif';
+  for(let e=-1;e<=4;e++){ const x=X(Math.pow(10,e)); ctx.beginPath(); ctx.moveTo(x,T); ctx.lineTo(x,T+ph); ctx.stroke();
+    ctx.textAlign='center'; ctx.fillText(e<0?'0.1':String(Math.pow(10,e)), x, T+ph+14); }
+  for(let e=11;e<=15;e++){ const y=Y(Math.pow(10,e)); ctx.beginPath(); ctx.moveTo(L,y); ctx.lineTo(L+pw,y); ctx.stroke();
+    ctx.textAlign='right'; ctx.fillText(e===15?'1P':e===12?'1T':e===13?'10T':e===14?'100T':'100G', L-4, y+4); }
+  ctx.textAlign='center'; ctx.fillText('算术强度（FLOP/字节，对数轴）', L+pw/2, H-4);
+  ctx.save(); ctx.translate(12, T+ph/2); ctx.rotate(-Math.PI/2); ctx.fillText('可达 FLOP/s', 0, 0); ctx.restore();
+  // 其他 GPU 的淡色屋顶
+  ctx.save(); ctx.beginPath(); ctx.rect(L,T,pw,ph); ctx.clip();
+  Object.keys(GPUS).forEach(k=>{
+    if(k===$('gpu').value) return;
+    const gg=GPUS[k], pk=gg[prec];
+    ctx.strokeStyle=css('--faint'); ctx.setLineDash([4,4]); ctx.lineWidth=1.5;
+    roof(gg.bw, pk); ctx.setLineDash([]);
+    ctx.fillStyle=css('--faint'); ctx.textAlign='right'; ctx.fillText(k, L+pw-4, Y(pk)-4);
+  });
+  function roof(b,pk){ ctx.beginPath(); let first=true;
+    for(let lx=x0; lx<=x1+0.001; lx+=0.02){ const a=Math.pow(10,lx), v=Math.min(pk, a*b);
+      const px=X(a), py=Y(v); if(first){ctx.moveTo(px,py);first=false;} else ctx.lineTo(px,py);} ctx.stroke(); }
+  // 选中 GPU 的屋顶：两段着色
+  ctx.lineWidth=3;
+  ctx.strokeStyle=css('--mem'); ctx.beginPath(); ctx.moveTo(X(Math.pow(10,x0)), Y(Math.pow(10,x0)*bw)); ctx.lineTo(X(ridge), Y(peak)); ctx.stroke();
+  ctx.strokeStyle=css('--comp'); ctx.beginPath(); ctx.moveTo(X(ridge), Y(peak)); ctx.lineTo(X(Math.pow(10,x1)), Y(peak)); ctx.stroke();
+  // 拐点
+  ctx.strokeStyle=css('--muted'); ctx.setLineDash([2,3]); ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(X(ridge), Y(peak)); ctx.lineTo(X(ridge), T+ph); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle=css('--muted'); ctx.textAlign='left'; ctx.fillText('拐点 '+ridge.toFixed(0), X(ridge)+4, T+ph-6);
+  // 当前点
+  const att=Math.min(peak, ai*bw), memBound = ai<ridge;
+  ctx.fillStyle = memBound?css('--mem'):css('--comp');
+  ctx.beginPath(); ctx.arc(X(ai), Y(att), 7, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle=css('--bg'); ctx.lineWidth=2; ctx.stroke();
+  ctx.restore();
+  // 区域文字
+  ctx.font='12px sans-serif'; ctx.textAlign='left';
+  ctx.fillStyle=css('--mem'); ctx.fillText('内存受限（斜坡）', L+8, T+16);
+  ctx.fillStyle=css('--comp'); ctx.textAlign='right'; ctx.fillText('计算受限（平顶）', L+pw-8, T+16);
+  // 文本
+  $('aiTxt').textContent=fmtAI(ai);
+  $('nTxt').textContent=Math.pow(2,+$('n').value);
+  $('sPeak').textContent=fmtF(peak);
+  $('sBw').textContent=(bw/1e12).toFixed(2)+' TB/s';
+  $('sRidge').textContent=ridge.toFixed(0)+' FLOP/字节';
+  $('sUtil').textContent=(att/peak*100).toFixed(att/peak<0.01?2:1)+'%';
+  const p=PRESETS.find(x=>x.id===current);
+  const tag = memBound
+    ? '<span class="badge" style="background:var(--mem)">内存受限</span>'
+    : '<span class="badge" style="background:var(--comp)">计算受限</span>';
+  const why = memBound
+    ? '每搬 1 字节只做 '+fmtAI(ai)+' 次运算，低于拐点 '+ridge.toFixed(0)+'：算力单元在等数据。想变快要减少搬运（融合、分块、低精度）。'
+    : '每字节的运算量已超过拐点，Tensor Core 被喂饱，再增大强度也不会更快。';
+  $('verdict').innerHTML = tag+' '+(p&&p.note? '<b>'+p.name+'</b>：'+p.note+'。 ':'')+why;
+}
+['gpu','prec'].forEach(id=>$(id).addEventListener('change',()=>{applyPreset();draw();}));
+$('ai').addEventListener('input',()=>{current='free'; applyPreset(); draw();});
+$('n').addEventListener('input',()=>{applyPreset(); draw();});
+window.addEventListener('resize', draw);
+if(window.matchMedia) window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', draw);
+current='matmul'; applyPreset(); draw();
+})();
+</script>
+</body>
+</html>

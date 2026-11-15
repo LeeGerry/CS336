@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>数据配比与 epoch</title>
+<style>
+:root{
+  --bg:#ffffff; --fg:#1f2328; --muted:#656d76; --card:#f6f8fa; --border:#d0d7de;
+  --accent:#3b6fd8; --ok:#2e7d32; --bad:#d1495b; --warn:#b26a00; --grid:#e6e9ed;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#16181d; --fg:#e6e8eb; --muted:#9aa4b2; --card:#20242b; --border:#363c46;
+    --accent:#7aa2ff; --ok:#6fd17a; --bad:#ff7a85; --warn:#f0b357; --grid:#2a2f37;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+h1{font-size:16px;margin:0 0 8px}
+h2{font-size:14px;margin:14px 0 6px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin:6px 0}
+label{color:var(--muted)}
+button{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 8px;cursor:pointer}
+button.on{border-color:var(--accent);color:var(--accent);font-weight:600}
+input[type=range]{width:100%}
+.small{font-size:12px;color:var(--muted)}
+.src{display:grid;grid-template-columns:90px 1fr 70px;gap:6px;align-items:center;margin:4px 0}
+.src .nm{font-weight:600}
+.res{display:grid;grid-template-columns:90px 1fr 92px;gap:6px;align-items:center;margin:3px 0;font-size:13px}
+.track{height:14px;background:var(--grid);border-radius:3px;position:relative;overflow:hidden}
+.fill{height:100%;border-radius:3px}
+.cap{position:absolute;top:0;bottom:0;width:2px;background:var(--warn)}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.bad{color:var(--bad);font-weight:700}
+.okc{color:var(--ok)}
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:8px}
+</style>
+</head>
+<body>
+<h1>数据配比（mixing）：别只看“质量”，还要看会把小数据源重复多少遍</h1>
+
+<div class="row">
+  <button id="pA" class="on">预设：课上的两源例子</button>
+  <button id="pB">预设：五个数据源</button>
+</div>
+
+<div class="card">
+  <div><label>本次训练总 token 数 T：<b id="TV"></b></label><input id="T" type="range" min="9" max="14" step="0.05" value="12"></div>
+  <div><label>每个源的 epoch 上限 C（UniMax 用）：<b id="CV"></b></label><input id="C" type="range" min="1" max="20" step="1" value="4"></div>
+</div>
+
+<h2>① 设定每个源的权重 p(s)（会自动归一化）</h2>
+<div class="card" id="srcs"></div>
+<div class="row">
+  <button id="uni">均匀分配</button>
+  <button id="prop">按 token 数比例分配</button>
+  <button id="unimax">UniMax：均匀 + epoch 上限</button>
+</div>
+
+<h2>② 结果：每个源被训练了几遍（epoch = p(s)·T ÷ 源大小）</h2>
+<div class="card" id="res"></div>
+<div class="small">条形长度按对数刻度（0.01 ~ 1000 遍）；橙色竖线是上限 C。epoch &lt; 1 表示这个源有一部分 token 从没被看到。</div>
+
+<h2>③ 模拟 epoch：小规模实验要“看起来像”大规模</h2>
+<div class="card">
+  <div class="small">用回归法找最优配比时，要在小模型上跑很多次。小规模 S 个 token 的实验里几乎不会重复数据，于是“猛加高质量小源”看起来总是对的；放到大规模 L 才发现重复了几十遍。解决：把每个源按 S/L 等比例下采样后再做小实验。</div>
+  <div><label>小规模实验 token 数 S：<b id="SV"></b></label><input id="S" type="range" min="8" max="11" step="0.05" value="10"></div>
+  <div class="small">大规模 L 取上面的 T。当前权重下：</div>
+  <div class="two">
+    <div class="card"><b>直接在小规模跑（源不下采样）</b><div id="naive"></div></div>
+    <div class="card"><b>模拟 epoch（源 × S/L）</b><div id="sim"></div></div>
+  </div>
+  <div id="verdict" class="small"></div>
+</div>
+
+<script>
+(function(){
+const PRE = {
+  pA: [{n:'低质量', size:10e12, w:0.5}, {n:'高质量', size:10e9, w:0.5}],
+  pB: [{n:'网页', size:10e12, w:0.5}, {n:'代码', size:1e12, w:0.2}, {n:'论文', size:100e9, w:0.15}, {n:'维基', size:10e9, w:0.1}, {n:'数学', size:5e9, w:0.05}]
+};
+let srcs = PRE.pA.map(o=>({...o}));
+const SIZES = [1e9, 2e9, 5e9, 10e9, 20e9, 50e9, 100e9, 200e9, 500e9, 1e12, 2e12, 5e12, 10e12, 20e12];
+function fmt(x){
+  if (x >= 1e12) return (x/1e12).toFixed(x>=1e13?0:1).replace(/\.0$/,'') + 'T';
+  if (x >= 1e9) return (x/1e9).toFixed(x>=1e10?0:1).replace(/\.0$/,'') + 'B';
+  if (x >= 1e6) return (x/1e6).toFixed(0) + 'M';
+  return x.toFixed(0);
+}
+function fmtE(e){ return e >= 100 ? e.toFixed(0) : e >= 10 ? e.toFixed(1) : e >= 0.1 ? e.toFixed(2) : e >= 0.001 ? String(+e.toFixed(4)) : e.toExponential(1); }
+const getT = () => Math.pow(10, +document.getElementById('T').value);
+const getC = () => +document.getElementById('C').value;
+const getS = () => Math.pow(10, +document.getElementById('S').value);
+function norm(){ const s = srcs.reduce((a,b)=>a+b.w,0) || 1; return srcs.map(o=>o.w/s); }
+
+function buildSrcs(){
+  const el = document.getElementById('srcs'); el.innerHTML = '';
+  srcs.forEach((o,i)=>{
+    const d = document.createElement('div'); d.className = 'src';
+    const sel = document.createElement('select');
+    sel.style.cssText = 'font:inherit;font-size:12px;color:var(--fg);background:var(--bg);border:1px solid var(--border);border-radius:6px';
+    SIZES.forEach(v=>{ const op = document.createElement('option'); op.value = v; op.textContent = fmt(v) + ' tokens'; if (v === o.size) op.selected = true; sel.appendChild(op); });
+    sel.onchange = ()=>{ o.size = +sel.value; render(); };
+    const nm = document.createElement('div'); nm.innerHTML = '<span class="nm">' + o.n + '</span>';
+    nm.appendChild(document.createElement('br')); nm.appendChild(sel);
+    const rg = document.createElement('input'); rg.type = 'range'; rg.min = 0; rg.max = 1; rg.step = 0.01; rg.value = o.w;
+    rg.oninput = ()=>{ o.w = +rg.value; render(); };
+    const pv = document.createElement('div'); pv.className = 'num'; pv.id = 'pv' + i;
+    d.appendChild(nm); d.appendChild(rg); d.appendChild(pv);
+    el.appendChild(d);
+  });
+}
+function syncSliders(){ document.querySelectorAll('#srcs input[type=range]').forEach((r,i)=>{ r.value = srcs[i].w; }); }
+
+function bar(e, C){
+  const lo = -2, hi = 3;
+  const pos = v => Math.max(0, Math.min(1, (Math.log10(Math.max(v,1e-3)) - lo) / (hi - lo))) * 100;
+  const col = e > C ? 'var(--bad)' : (e < 1 ? 'var(--accent)' : 'var(--ok)');
+  return '<div class="track"><div class="fill" style="width:' + pos(e).toFixed(1) + '%;background:' + col + '"></div><div class="cap" style="left:' + pos(C).toFixed(1) + '%"></div></div>';
+}
+function epochs(p, T, sizes){ return p.map((pi,i)=>pi*T/sizes[i]); }
+
+function render(){
+  const T = getT(), C = getC(), S = getS();
+  document.getElementById('TV').textContent = fmt(T);
+  document.getElementById('CV').textContent = C + ' 遍';
+  document.getElementById('SV').textContent = fmt(S);
+  const p = norm();
+  p.forEach((v,i)=>{ const el = document.getElementById('pv'+i); if (el) el.textContent = (v*100).toFixed(1) + '%'; });
+  const sizes = srcs.map(o=>o.size);
+  const E = epochs(p, T, sizes);
+  let h = '';
+  srcs.forEach((o,i)=>{
+    h += '<div class="res"><span>' + o.n + '<br><span class="small">' + fmt(p[i]*T) + ' / ' + fmt(o.size) + '</span></span>' + bar(E[i], C) +
+      '<span class="num ' + (E[i] > C ? 'bad' : '') + '">' + fmtE(E[i]) + ' 遍</span></div>';
+  });
+  const worst = E.indexOf(Math.max(...E));
+  h += '<div class="small" style="margin-top:4px">手算：' + srcs[worst].n + ' 的 epoch = ' + (p[worst]*100).toFixed(1) + '% × ' + fmt(T) + ' ÷ ' + fmt(sizes[worst]) + ' ≈ <b>' + fmtE(E[worst]) + '</b> 遍' +
+    (E[worst] > C ? '，<span class="bad">超过上限，容易过拟合/浪费算力</span>' : '') + '</div>';
+  const totalUnique = sizes.reduce((a,b)=>a+b,0);
+  if (T > C * totalUnique) h += '<div class="bad small">提示：T 已超过所有源总量 × C，任何配比都会有源超过上限。</div>';
+  document.getElementById('res').innerHTML = h;
+
+  // simulated epoching
+  const L = T, ratio = S / L;
+  const En = epochs(p, S, sizes);
+  const Es = epochs(p, S, sizes.map(x=>x*ratio));
+  const list = (EE)=>srcs.map((o,i)=>'<div class="res" style="grid-template-columns:60px 1fr 70px"><span>' + o.n + '</span>' + bar(EE[i], C) + '<span class="num ' + (EE[i] > C ? 'bad' : '') + '">' + fmtE(EE[i]) + '</span></div>').join('');
+  document.getElementById('naive').innerHTML = list(En);
+  document.getElementById('sim').innerHTML = list(Es) + '<div class="small">下采样比例 S/L = ' + (ratio >= 1 ? '1（S ≥ L，无需下采样）' : ratio.toExponential(1)) + '</div>';
+  const maxN = Math.max(...En), maxS = Math.max(...Es);
+  document.getElementById('verdict').innerHTML = '不下采样时，小实验里最多重复 <b>' + fmtE(maxN) + '</b> 遍，看起来' + (maxN > C ? '已经超限' : '<span class="okc">很安全</span>') +
+    '；模拟 epoch 后是 <b>' + fmtE(maxS) + '</b> 遍——这才是放到 ' + fmt(L) + ' 规模时的真实情况（与②一致）。';
+}
+
+function unimax(){
+  const T = getT(), C = getC();
+  const idx = srcs.map((o,i)=>i).sort((a,b)=>srcs[a].size - srcs[b].size);
+  let budget = T, left = idx.length; const alloc = new Array(srcs.length).fill(0);
+  idx.forEach(i=>{ const a = Math.min(C * srcs[i].size, budget / left); alloc[i] = a; budget -= a; left--; });
+  const tot = alloc.reduce((a,b)=>a+b,0) || 1;
+  srcs.forEach((o,i)=>{ o.w = alloc[i] / tot; });
+  syncSliders(); render();
+}
+document.getElementById('uni').onclick = ()=>{ srcs.forEach(o=>o.w = 1/srcs.length); syncSliders(); render(); };
+document.getElementById('prop').onclick = ()=>{ const s = srcs.reduce((a,b)=>a+b.size,0); srcs.forEach(o=>o.w = o.size/s); syncSliders(); render(); };
+document.getElementById('unimax').onclick = unimax;
+['T','C','S'].forEach(id=>document.getElementById(id).addEventListener('input', render));
+['pA','pB'].forEach(id=>{
+  document.getElementById(id).onclick = ()=>{
+    srcs = PRE[id].map(o=>({...o}));
+    document.getElementById('pA').classList.toggle('on', id==='pA');
+    document.getElementById('pB').classList.toggle('on', id==='pB');
+    buildSrcs(); render();
+  };
+});
+buildSrcs(); render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>逐算子 kernel vs 巨型 kernel</title>
+<style>
+:root{
+  --bg:#ffffff; --fg:#1f2328; --muted:#656d76; --card:#f6f8fa; --border:#d0d7de; --accent:#3b6fd8;
+  --gap:#f2c94c; --o0:#3b6fd8; --o1:#2e7d32; --o2:#c77d00; --o3:#7b4fd6; --o4:#d1495b; --o5:#0f8b8d; --row:#eef1f4;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#16181d; --fg:#e6e8eb; --muted:#9aa4b2; --card:#20242b; --border:#363c46; --accent:#7aa2ff;
+    --gap:#8a7330; --o0:#7aa2ff; --o1:#6fd17a; --o2:#ffb84d; --o3:#b393ff; --o4:#ff7a85; --o5:#4fd1d3; --row:#262b33;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+h1{font-size:16px;margin:0 0 8px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+button{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 10px;cursor:pointer}
+button.on{border-color:var(--accent);color:var(--accent);font-weight:600}
+input[type=range]{flex:1;min-width:120px}
+canvas{width:100%;display:block;border-radius:8px;background:var(--card);border:1px solid var(--border);margin-top:6px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:8px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:6px 10px}
+.card b{display:block;font-size:16px}
+.small{font-size:12px;color:var(--muted)}
+.legend span{display:inline-block;width:10px;height:10px;border-radius:2px;margin:0 3px 0 8px;vertical-align:middle}
+</style>
+</head>
+<body>
+<h1>decode 一层 Transformer：每个 SM 在什么时候真正干活？</h1>
+<div class="row" id="modes">
+  <button data-m="sep" class="on">每个算子一个 kernel</button>
+  <button data-m="mega">巨型 kernel（megakernel）</button>
+  <button id="cmp">两者对比</button>
+</div>
+<div class="row">
+  <span class="small">kernel 启动+收尾开销</span><input id="lat" type="range" min="0" max="12" value="6"><b id="latTxt"></b>
+</div>
+<div class="row">
+  <span class="small">耗时抖动（尾部效应）</span><input id="jit" type="range" min="0" max="100" value="50"><b id="jitTxt"></b>
+  <button id="seed">换一组随机耗时</button><button id="play">▶ 播放时间轴</button>
+</div>
+<div class="small legend" id="legend"></div>
+<canvas id="cv"></canvas>
+<div class="stats">
+  <div class="card"><span class="small">逐算子：总时间 / SM 忙碌率</span><b id="s1"></b></div>
+  <div class="card"><span class="small">巨型 kernel：总时间 / SM 忙碌率</span><b id="s2"></b></div>
+  <div class="card"><span class="small">加速比</span><b id="s3"></b></div>
+</div>
+<p class="small">横轴是时间，每一行是一个 SM（真实 H100 有 132 个，这里画 12 个示意）。浅色段 = 加载权重 / KV cache，深色段 = 计算；空白 = 空等；黄色竖条 = kernel 启动与收尾。巨型 kernel 里，空闲的 SM 可以提前去加载下一个算子的权重（不依赖上一步结果），而计算部分仍要等上一个算子完成。数值为示意模型，不对应真实测量。</p>
+<script>
+(function(){
+const $=id=>document.getElementById(id);
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const S=12;
+const OPS=[
+  {n:'RMSNorm',u:12,l:2,c:2},
+  {n:'QKV+RoPE',u:24,l:6,c:3},
+  {n:'Attention',u:12,l:8,c:4},
+  {n:'O 投影',u:24,l:5,c:2},
+  {n:'MLP 上投影',u:36,l:6,c:3},
+  {n:'MLP 下投影',u:24,l:6,c:2}
+];
+let mode='sep', seed=7, cmp=false, cursor=null, raf=null;
+function rng(s){ return function(){ s=(s*1664525+1013904223)%4294967296; return s/4294967296; }; }
+function durations(){
+  const r=rng(seed), j=+$('jit').value/100;
+  return OPS.map(o=>Array.from({length:o.u},()=>({l:o.l*(1-0.5*j+j*r()*1.0+ (r()<0.08*j? 1.5*j:0)), c:o.c*(1-0.4*j+0.8*j*r())})));
+}
+function simulate(m){
+  const D=durations(), lat=+$('lat').value; const segs=[], gaps=[]; let free=Array(S).fill(0), t=0, busy=0;
+  if(m==='sep'){
+    OPS.forEach((o,k)=>{
+      gaps.push([t,t+lat*0.6]); t+=lat*0.6; free.fill(t); let end=t;
+      D[k].forEach(d=>{ let s=0; for(let i=1;i<S;i++) if(free[i]<free[s]) s=i;
+        const a=free[s]; segs.push({s,k,a,b:a+d.l,load:true}); segs.push({s,k,a:a+d.l,b:a+d.l+d.c,load:false});
+        free[s]=a+d.l+d.c; busy+=d.l+d.c; end=Math.max(end,free[s]); });
+      gaps.push([end,end+lat*0.4]); t=end+lat*0.4;
+    });
+  } else {
+    gaps.push([0,lat*0.6]); free.fill(lat*0.6); let prevDone=lat*0.6;
+    OPS.forEach((o,k)=>{ let done=prevDone;
+      D[k].forEach(d=>{ let s=0; for(let i=1;i<S;i++) if(free[i]<free[s]) s=i;
+        const a=free[s], le=a+d.l, cs=Math.max(le,prevDone), ce=cs+d.c;
+        segs.push({s,k,a,b:le,load:true}); segs.push({s,k,a:cs,b:ce,load:false});
+        free[s]=ce; busy+=d.l+d.c; done=Math.max(done,ce); });
+      prevDone=done; });
+    t=prevDone; gaps.push([t,t+lat*0.4]); t+=lat*0.4;
+  }
+  return {segs,gaps,T:t,util:busy/(S*t)};
+}
+function drawOne(ctx,res,x0,y0,w,h,Tmax,title){
+  const rh=h/S; ctx.font='11px sans-serif';
+  ctx.fillStyle=css('--muted'); ctx.textAlign='left'; ctx.fillText(title,x0,y0-4);
+  for(let s=0;s<S;s++){ ctx.fillStyle=css('--row'); ctx.fillRect(x0,y0+s*rh,w,rh-1); }
+  const X=v=>x0+v/Tmax*w, lim=cursor==null?Infinity:cursor;
+  res.gaps.forEach(([a,b])=>{ if(a>lim) return; ctx.fillStyle=css('--gap'); ctx.fillRect(X(a),y0,Math.max(1,X(Math.min(b,lim))-X(a)),h-1); });
+  res.segs.forEach(g=>{ if(g.a>lim) return; const b=Math.min(g.b,lim); ctx.fillStyle=css('--o'+g.k); ctx.globalAlpha=g.load?0.4:1;
+    ctx.fillRect(X(g.a),y0+g.s*rh+1,Math.max(0.5,X(b)-X(g.a)-0.3),rh-3); ctx.globalAlpha=1; });
+  ctx.strokeStyle=css('--fg'); ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(X(res.T),y0); ctx.lineTo(X(res.T),y0+h); ctx.stroke();
+  if(cursor!=null){ ctx.strokeStyle=css('--accent'); ctx.beginPath(); ctx.moveTo(X(Math.min(cursor,Tmax)),y0); ctx.lineTo(X(Math.min(cursor,Tmax)),y0+h); ctx.stroke(); }
+}
+function draw(){
+  $('latTxt').textContent=$('lat').value; $('jitTxt').textContent=$('jit').value+'%';
+  const A=simulate('sep'), B=simulate('mega');
+  $('s1').textContent=A.T.toFixed(0)+' / '+(A.util*100).toFixed(0)+'%';
+  $('s2').textContent=B.T.toFixed(0)+' / '+(B.util*100).toFixed(0)+'%';
+  $('s3').textContent=(A.T/B.T).toFixed(2)+'×';
+  const cv=$('cv'), ctx=cv.getContext('2d'), dpr=window.devicePixelRatio||1, W=cv.clientWidth;
+  const one=150, H=cmp? one*2+44 : one+28;
+  cv.style.height=H+'px'; cv.width=W*dpr; cv.height=H*dpr; ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H);
+  const Tmax=Math.max(A.T,B.T);
+  if(cmp){ drawOne(ctx,A,8,18,W-16,one,Tmax,'逐算子 kernel'); drawOne(ctx,B,8,one+40,W-16,one,Tmax,'巨型 kernel'); }
+  else drawOne(ctx, mode==='sep'?A:B, 8,18,W-16,one, Tmax, mode==='sep'?'逐算子 kernel':'巨型 kernel');
+}
+$('legend').innerHTML=OPS.map((o,k)=>'<span style="background:var(--o'+k+')"></span>'+o.n).join('')+'<span style="background:var(--gap)"></span>启动/收尾';
+document.querySelectorAll('#modes button[data-m]').forEach(b=>b.onclick=()=>{ cmp=false; mode=b.dataset.m;
+  document.querySelectorAll('#modes button').forEach(x=>x.classList.toggle('on',x===b)); draw(); });
+$('cmp').onclick=()=>{ cmp=true; document.querySelectorAll('#modes button').forEach(x=>x.classList.toggle('on',x.id==='cmp')); draw(); };
+$('lat').oninput=draw; $('jit').oninput=draw;
+$('seed').onclick=()=>{ seed=(seed*31+17)%100000; draw(); };
+$('play').onclick=()=>{ if(raf) cancelAnimationFrame(raf); const A=simulate('sep'),B=simulate('mega'), Tm=Math.max(A.T,B.T); const t0=performance.now();
+  function f(now){ cursor=(now-t0)/4000*Tm; if(cursor>=Tm){ cursor=null; draw(); raf=null; return; } draw(); raf=requestAnimationFrame(f); } raf=requestAnimationFrame(f); };
+window.addEventListener('resize',draw);
+draw();
+})();
+</script>
+</body>
+</html>

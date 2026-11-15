@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>算子融合与 HBM 读写</title>
+<style>
+:root{
+  --bg:#ffffff; --fg:#1f2328; --muted:#656d76; --card:#f6f8fa; --border:#d0d7de;
+  --read:#3b6fd8; --write:#d1495b; --sm:#2e7d32; --accent:#3b6fd8; --hbm:#c77d00;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#16181d; --fg:#e6e8eb; --muted:#9aa4b2; --card:#20242b; --border:#363c46;
+    --read:#7aa2ff; --write:#ff7a85; --sm:#6fd17a; --accent:#7aa2ff; --hbm:#ffb84d;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+h1{font-size:16px;margin:0 0 8px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+button,select{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 10px;cursor:pointer}
+button.on{border-color:var(--accent);color:var(--accent);font-weight:600}
+canvas{width:100%;display:block;border-radius:8px;background:var(--card);border:1px solid var(--border)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:8px 10px}
+.bar{height:12px;border-radius:6px;background:var(--border);overflow:hidden;margin:4px 0}
+.bar i{display:block;height:100%;background:var(--write)}
+.small{font-size:12px;color:var(--muted)}
+code{font-family:ui-monospace,Menlo,monospace;font-size:12px}
+@media (max-width:420px){.grid2{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<h1>不融合 vs 融合：数一数往返 HBM 的次数</h1>
+<div class="row">
+  <label>算子</label>
+  <select id="op"><option value="gelu">GeLU（tanh 近似）</option><option value="softmax">按行 softmax</option><option value="sincos">sin²x + cos²x</option></select>
+  <span id="modes"><button data-m="naive" class="on">不融合（逐个 kernel）</button> <button data-m="fused">融合（一个 kernel）</button></span>
+</div>
+<div class="row">
+  <button id="play">▶ 播放</button><button id="step">单步</button><button id="reset">重置</button>
+  <label>GPU</label><select id="gpu"><option value="2.0">A100 · 2 TB/s</option><option value="3.35" selected>H100 · 3.35 TB/s</option><option value="8">B200 · 8 TB/s</option></select>
+</div>
+<div class="small" id="formula"></div>
+<canvas id="cv"></canvas>
+<div class="grid2">
+  <div class="card"><b>不融合</b>：读 <span id="nr">-</span>，写 <span id="nw">-</span>
+    <div class="bar"><i id="bn" style="width:100%"></i></div><span class="small" id="tn"></span></div>
+  <div class="card"><b>融合</b>：读 <span id="fr">-</span>，写 <span id="fw">-</span>
+    <div class="bar"><i id="bf" style="width:10%;background:var(--sm)"></i></div><span class="small" id="tf"></span></div>
+</div>
+<p class="small" id="msg"></p>
+<p class="small">“1 次读/写”指把一个与输入同样大小的张量完整搬一遍（softmax 中 M 表示每行一个标量，量级小可忽略）。时间按 16384×16384 的 FP32 张量（约 1.07 GB）估算纯搬运下界 = 字节数 ÷ HBM 带宽，忽略计算与 kernel 启动开销。</p>
+<script>
+(function(){
+const $=id=>document.getElementById(id);
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+// 每个 kernel：name, reads[], writes[]；张量名为 HBM 中的"格子"
+const OPS={
+  gelu:{
+    formula:'<code>y = 0.5·x·(1 + tanh(0.79788456·(x + 0.044715·x³)))</code>，按 PyTorch 原语逐个计算（示意拆分）',
+    naive:[
+      {n:'t1 = x*x',r:['x','x'],w:['t1']},
+      {n:'t2 = t1*x',r:['t1','x'],w:['t2']},
+      {n:'t3 = 0.044715*t2',r:['t2'],w:['t3']},
+      {n:'t4 = x + t3',r:['x','t3'],w:['t4']},
+      {n:'t5 = 0.798*t4',r:['t4'],w:['t5']},
+      {n:'t6 = tanh(t5)',r:['t5'],w:['t6']},
+      {n:'t7 = 1 + t6',r:['t6'],w:['t7']},
+      {n:'t8 = 0.5*x',r:['x'],w:['t8']},
+      {n:'y = t8*t7',r:['t8','t7'],w:['y']}],
+    fused:[{n:'fused_gelu(x)：全部在寄存器里算完',r:['x'],w:['y']}],
+    slots:['x','t1','t2','t3','t4','t5','t6','t7','t8','y']
+  },
+  softmax:{
+    formula:'按讲义 <code>naive_softmax</code> 的 5 步：max → 减 max → exp → 求和 → 相除。课上给出的总量：读 5MN+M，写 3MN+2M；理想只需读 MN、写 MN',
+    naive:[
+      {n:'m = x.max(dim=1)',r:['x'],w:['m'],small:['m']},
+      {n:'z = x - m',r:['x','m'],w:['z'],small:['m']},
+      {n:'e = exp(z)',r:['z'],w:['e']},
+      {n:'s = e.sum(dim=1)',r:['e'],w:['s'],small:['s']},
+      {n:'y = e / s',r:['e','s'],w:['y'],small:['s']}],
+    fused:[{n:'triton_softmax：一行装进一个 block，max/exp/sum/除法都在片上',r:['x'],w:['y']}],
+    slots:['x','m','z','e','s','y'], small:['m','s']
+  },
+  sincos:{
+    formula:'<code>sin(x)**2 + cos(x)**2</code>：课上的例子，朴素执行会启动 5 个 kernel',
+    naive:[
+      {n:'a = sin(x)',r:['x'],w:['a']},
+      {n:'b = cos(x)',r:['x'],w:['b']},
+      {n:'c = a**2',r:['a'],w:['c']},
+      {n:'d = b**2',r:['b'],w:['d']},
+      {n:'y = c + d',r:['c','d'],w:['y']}],
+    fused:[{n:'torch.compile 生成的单个融合 kernel',r:['x'],w:['y']}],
+    slots:['x','a','b','c','d','y']
+  }
+};
+let op='gelu', mode='naive', ks=[], idx=0, written, cnt, anim=null, playing=false, busy=false, gen=0;
+function tally(list, small){ let r=0,w=0; list.forEach(k=>{ k.r.forEach(t=>{ if(!(small||[]).includes(t)) r++; }); k.w.forEach(t=>{ if(!(small||[]).includes(t)) w++; }); }); return {r,w}; }
+function summary(){
+  const o=OPS[op], a=tally(o.naive,o.small), b=tally(o.fused,o.small), bw=+$('gpu').value*1e12, GB=16384*16384*4;
+  $('nr').textContent=a.r; $('nw').textContent=a.w; $('fr').textContent=b.r; $('fw').textContent=b.w;
+  const tN=(a.r+a.w)*GB/bw*1e3, tF=(b.r+b.w)*GB/bw*1e3;
+  $('tn').textContent='搬运 '+(a.r+a.w)+' 遍 ≈ '+tN.toFixed(2)+' ms'; $('tf').textContent='搬运 '+(b.r+b.w)+' 遍 ≈ '+tF.toFixed(2)+' ms（快约 '+(tN/tF).toFixed(1)+' 倍）';
+  $('bf').style.width=((b.r+b.w)/(a.r+a.w)*100)+'%';
+  $('formula').innerHTML=o.formula;
+}
+function build(){
+  gen++; busy=false; anim=null; const o=OPS[op]; ks=o[mode]; idx=0; written=new Set(['x']); cnt={r:0,w:0};
+  summary(); draw(); msg();
+}
+function msg(){
+  const o=OPS[op];
+  $('msg').textContent = idx<ks.length ? '下一步 kernel '+(idx+1)+'/'+ks.length+'：'+ks[idx].n : '完成：本模式共读 '+cnt.r+' 次、写 '+cnt.w+' 次（大张量），中间结果'+(mode==='naive'?'全部落回了 HBM。':'从未离开芯片。');
+}
+function draw(){
+  const cv=$('cv'), ctx=cv.getContext('2d'), dpr=window.devicePixelRatio||1, W=cv.clientWidth, H=230;
+  cv.style.height=H+'px'; cv.width=W*dpr; cv.height=H*dpr; ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,W,H);
+  const o=OPS[op], slots=mode==='fused'?['x','y']:o.slots;
+  // HBM 区
+  ctx.fillStyle=css('--hbm'); ctx.globalAlpha=0.15; ctx.fillRect(8,8,W-16,62); ctx.globalAlpha=1;
+  ctx.fillStyle=css('--fg'); ctx.font='12px sans-serif'; ctx.textAlign='left'; ctx.fillText('HBM（显存，慢）', 14, 22);
+  const sw=Math.min(54,(W-32)/slots.length-4);
+  const sx=i=>16+i*((W-32)/slots.length)+((W-32)/slots.length-sw)/2;
+  slots.forEach((t,i)=>{
+    const has=written.has(t); const small=(o.small||[]).includes(t);
+    ctx.strokeStyle=css('--border'); ctx.fillStyle=has?css(t==='y'?'--sm':'--accent'):css('--bg');
+    ctx.globalAlpha=has?0.85:1; ctx.fillRect(sx(i),30,sw,small?14:30); ctx.globalAlpha=1; ctx.strokeRect(sx(i),30,sw,small?14:30);
+    ctx.fillStyle=has?'#fff':css('--muted'); ctx.textAlign='center'; ctx.fillText(t, sx(i)+sw/2, small?41:50);
+  });
+  // SM 区
+  const smy=150;
+  ctx.fillStyle=css('--sm'); ctx.globalAlpha=0.15; ctx.fillRect(8,smy,W-16,72); ctx.globalAlpha=1;
+  ctx.fillStyle=css('--fg'); ctx.textAlign='left'; ctx.fillText('SM（片上寄存器 / 共享内存，快）', 14, smy+16);
+  if(anim){
+    const k=anim.k; ctx.textAlign='center'; ctx.font='13px sans-serif'; ctx.fillStyle=css('--fg');
+    ctx.fillText('kernel：'+k.n, W/2, smy+44);
+    const ph=anim.t; // 0-0.45 读，0.45-0.6 计算，0.6-1 写
+    const pos=t=>slots.indexOf(t);
+    if(ph<0.45){ const f=ph/0.45; k.r.forEach((t,j)=>{ const i=pos(t); if(i<0) return; const x0=sx(i)+sw/2+(j-0.5)*6, y=60+(smy-60)*f;
+        ctx.fillStyle=css('--read'); ctx.beginPath(); ctx.arc(x0+(W/2-x0)*f, y, 6,0,7); ctx.fill(); }); }
+    else if(ph<0.6){ ctx.strokeStyle=css('--sm'); ctx.lineWidth=3; ctx.beginPath(); ctx.arc(W/2, smy+60, 6+ (ph-0.45)*80, 0, 7); ctx.stroke(); }
+    else { const f=(ph-0.6)/0.4; k.w.forEach(t=>{ const i=pos(t); if(i<0) return; const x1=sx(i)+sw/2, y=smy-(smy-60)*f;
+        ctx.fillStyle=css('--write'); ctx.beginPath(); ctx.arc(W/2+(x1-W/2)*f, y, 6,0,7); ctx.fill(); }); }
+  }
+  ctx.font='12px sans-serif'; ctx.textAlign='right'; ctx.fillStyle=css('--read'); ctx.fillText('● 读 HBM '+cnt.r, W-14, 98);
+  ctx.fillStyle=css('--write'); ctx.fillText('● 写 HBM '+cnt.w, W-14, 116);
+}
+function stepOnce(done){
+  if(idx>=ks.length){ done&&done(); return; }
+  const k=ks[idx], t0=performance.now(), dur=1100, g=gen, o=OPS[op];
+  function f(now){ if(g!==gen) return; anim={k,t:(now-t0)/dur}; draw();
+    if(anim.t<1) requestAnimationFrame(f);
+    else { k.r.forEach(t=>{ if(!(o.small||[]).includes(t)) cnt.r++; }); k.w.forEach(t=>{ written.add(t); if(!(o.small||[]).includes(t)) cnt.w++; });
+      idx++; anim=null; draw(); msg(); done&&done(); } }
+  requestAnimationFrame(f);
+}
+function loop(){ if(!playing) return; if(idx>=ks.length){ playing=false; $('play').textContent='▶ 播放'; return; } busy=true; stepOnce(()=>{ busy=false; setTimeout(loop,150); }); }
+$('play').onclick=()=>{ if(playing){ playing=false; $('play').textContent='▶ 播放'; return; } if(idx>=ks.length) build(); playing=true; $('play').textContent='⏸ 暂停'; if(!busy) loop(); };
+$('step').onclick=()=>{ if(busy) return; playing=false; $('play').textContent='▶ 播放'; busy=true; stepOnce(()=>{ busy=false; if(playing) loop(); }); };
+$('reset').onclick=()=>{ playing=false; $('play').textContent='▶ 播放'; build(); };
+$('op').onchange=()=>{ playing=false; $('play').textContent='▶ 播放'; op=$('op').value; build(); };
+$('gpu').onchange=summary;
+document.querySelectorAll('#modes button').forEach(b=>b.onclick=()=>{ document.querySelectorAll('#modes button').forEach(x=>x.classList.toggle('on',x===b)); mode=b.dataset.m; playing=false; $('play').textContent='▶ 播放'; build(); });
+window.addEventListener('resize',draw);
+build();
+})();
+</script>
+</body>
+</html>

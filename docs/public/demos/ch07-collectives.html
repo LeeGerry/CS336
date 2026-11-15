@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>集合通信动画</title>
+<style>
+:root{
+  --bg:#ffffff; --panel:#f5f6f8; --fg:#1d2330; --muted:#667085; --line:#d0d5dd;
+  --accent:#2563eb; --gpu:#eef2ff; --gpu-border:#94a3b8; --empty:#e5e7eb;
+  --c0:#2563eb; --c1:#16a34a; --c2:#ea580c; --c3:#9333ea; --chipText:#fff; --sw:#cbd5e1;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#111418; --panel:#1b2027; --fg:#e6e9ef; --muted:#98a2b3; --line:#344054;
+    --accent:#60a5fa; --gpu:#1e2633; --gpu-border:#475467; --empty:#2a313c;
+    --c0:#3b82f6; --c1:#22c55e; --c2:#f97316; --c3:#a855f7; --chipText:#fff; --sw:#475467;
+  }
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;font-size:14px}
+.wrap{max-width:760px;margin:0 auto;padding:12px}
+h1{font-size:16px;margin:0 0 8px}
+.row{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;align-items:center}
+button{font:inherit;border:1px solid var(--line);background:var(--panel);color:var(--fg);
+  padding:5px 10px;border-radius:6px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+button:disabled{opacity:.45;cursor:not-allowed}
+.label{color:var(--muted);font-size:12px;margin-right:2px}
+svg{width:100%;height:auto;display:block;background:var(--panel);border-radius:10px}
+.caption{background:var(--panel);border-radius:8px;padding:8px 10px;margin-top:8px;min-height:44px;line-height:1.6}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;
+  background:var(--empty);padding:1px 5px;border-radius:4px;word-break:break-all}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px}
+.stat{background:var(--panel);border-radius:8px;padding:6px;text-align:center;font-size:12px}
+.stat b{display:block;font-size:15px}
+.note{color:var(--muted);font-size:12px;margin-top:6px;line-height:1.5}
+@media (max-width:420px){ .stats{grid-template-columns:repeat(2,1fr)} button{padding:5px 8px} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>4 张 GPU 之间的集合通信</h1>
+  <div class="row" id="ops"></div>
+  <div class="row">
+    <span class="label">视图：</span>
+    <button id="mLogic" class="on">逻辑视图（经 NVSwitch 一步到位）</button>
+    <button id="mRing">环形算法（Ring，只和邻居通信）</button>
+  </div>
+  <svg id="stage" viewBox="0 0 560 400" aria-label="GPU 通信示意图"></svg>
+  <div class="row" style="margin-top:8px">
+    <button id="bReset">⟲ 重置</button>
+    <button id="bPrev">◀ 上一步</button>
+    <button id="bStep">单步 ▶</button>
+    <button id="bPlay">▶ 自动播放</button>
+    <span class="label" id="stepInfo"></span>
+  </div>
+  <div class="caption" id="caption"></div>
+  <div class="caption" id="codeLine" style="min-height:0"></div>
+  <div class="stats" id="stats"></div>
+  <div class="note">每个小方块是张量的 1/4（一个“块”）。方块下方的 4 个小点表示这个数已经累加了几张卡的贡献。下方计数是每张卡“发出去”的块数：环形 all-reduce 每卡共发 6 块 = 1.5 份张量 = 2(N−1)/N 份，这正是 all-reduce 的通信量公式。</div>
+</div>
+<script>
+(function(){
+  var N = 4;
+  var svgNS = "http://www.w3.org/2000/svg";
+  var stage = document.getElementById("stage");
+  // 方框位置：0 左上，1 右上，2 右下，3 左下（顺时针 = 环的方向）
+  var BOX = [{x:20,y:20},{x:300,y:20},{x:300,y:240},{x:20,y:240}];
+  var BW = 240, BH = 140, SL = 44, SG = 10;
+  function slotPos(r,j){ var b = BOX[r]; var x0 = b.x + (BW - (4*SL+3*SG))/2; return {x:x0 + j*(SL+SG) + SL/2, y:b.y + 78}; }
+  function el(tag, attrs, parent){ var e = document.createElementNS(svgNS, tag); for (var k in attrs) e.setAttribute(k, attrs[k]); if (parent) parent.appendChild(e); return e; }
+  function colorVar(i){ return "var(--c"+i+")"; }
+
+  function cell(v, col, r){ var c=[false,false,false,false]; c[r]=true; return {v:v, col:col, c:c}; }
+  function emptyState(){ var s=[]; for (var r=0;r<N;r++){ s.push([null,null,null,null]); } return s; }
+  function clone(s){ return s.map(function(row){ return row.map(function(x){ return x ? {v:x.v,col:x.col,c:x.c.slice()} : null; }); }); }
+
+  // ---- 定义各个操作 ----
+  function T(f,fs,t,ts,mode){ return {f:f,fs:fs,t:t,ts:ts,mode:mode}; }
+  function clearNonOwned(s){ for (var r=0;r<N;r++) for (var j=0;j<N;j++) if (j!==r) s[r][j]=null; }
+  function rsLogical(){ var tr=[]; for (var i=0;i<N;i++) for (var r=0;r<N;r++) if (r!==i) tr.push(T(r,i,i,i,"add")); return tr; }
+  function agLogical(){ var tr=[]; for (var j=0;j<N;j++) for (var r=0;r<N;r++) if (r!==j) tr.push(T(j,j,r,j,"copy")); return tr; }
+  function rsRingStep(s){ var tr=[]; for (var r=0;r<N;r++){ var c=((r-s-1)%N+N)%N; tr.push(T(r,c,(r+1)%N,c,"add")); } return tr; }
+  function agRingStep(s){ var tr=[]; for (var r=0;r<N;r++){ var c=((r-s)%N+N)%N; tr.push(T(r,c,(r+1)%N,c,"copy")); } return tr; }
+
+  var OPS = {
+    broadcast:{ name:"Broadcast 广播", ring:false,
+      code:"dist.broadcast(tensor, src=0)",
+      init:function(){ var s=emptyState(); for (var j=0;j<N;j++) s[0][j]=cell(j,j,0); return s; },
+      intro:"开始：只有 rank 0 有完整张量 [0,1,2,3]（例如它刚从磁盘读入初始 checkpoint）。",
+      steps:function(){ var tr=[]; for (var r=1;r<N;r++) for (var j=0;j<N;j++) tr.push(T(0,j,r,j,"copy"));
+        return [{tr:tr, cap:"rank 0 把整份张量复制给其他所有 rank。结束后 4 张卡内容完全相同。典型用途：训练开始时分发初始权重，只做一次。"}]; } },
+    scatter:{ name:"Scatter 分发", ring:false,
+      code:"dist.scatter(out, scatter_list, src=0)",
+      init:function(){ var s=emptyState(); for (var j=0;j<N;j++) s[0][j]=cell(j,j,0); return s; },
+      intro:"开始：rank 0 有张量 [0,1,2,3]，准备切成 4 份分给大家。",
+      steps:function(){ var tr=[]; for (var j=1;j<N;j++) tr.push(T(0,j,j,j,"move"));
+        return [{tr:tr, cap:"第 j 块发给 rank j。每张卡只拿到自己那一份。它是理解 reduce-scatter 的垫脚石。"}]; } },
+    gather:{ name:"Gather 收集", ring:false,
+      code:"dist.gather(tensor, gather_list, dst=0)",
+      init:function(){ var s=emptyState(); for (var r=0;r<N;r++) s[r][r]=cell(r,r,r); return s; },
+      intro:"开始：每个 rank 各持有一块（rank i 持有数字 i）。",
+      steps:function(){ var tr=[]; for (var r=1;r<N;r++) tr.push(T(r,r,0,r,"copy"));
+        return [{tr:tr, cap:"所有块汇总拼接到 rank 0，得到 [0,1,2,3]。Gather 是 Scatter 的逆操作。"}]; } },
+    reduce:{ name:"Reduce 归约", ring:false,
+      code:"dist.reduce(tensor, dst=0, op=dist.ReduceOp.SUM)",
+      init:function(){ var s=emptyState(); for (var r=0;r<N;r++) s[r][0]=cell(r,0,r); return s; },
+      intro:"开始：rank i 持有数字 i。",
+      steps:function(){ var tr=[]; for (var r=1;r<N;r++) tr.push(T(r,0,0,0,"add"));
+        return [{tr:tr, cap:"把所有 rank 的数按“求和”合并到 rank 0：0+1+2+3 = 6。也可以是 max、min 等满足结合律/交换律的运算。"}]; } },
+    allgather:{ name:"All-gather", ring:true,
+      code:"dist.all_gather_into_tensor(output, input)",
+      init:function(){ var s=emptyState(); for (var r=0;r<N;r++) s[r][r]=cell(r,r,r); return s; },
+      intro:"开始：rank i 只有第 i 块（想象成 FSDP 里每张卡只存 1/4 的参数）。",
+      steps:function(ring){
+        if (!ring) return [{tr:agLogical(), cap:"每个 rank 把自己的块发给所有人。结束后每张卡都有完整的 [0,1,2,3]。用途：前向计算前把分片参数凑齐。"}];
+        var st=[]; for (var s=0;s<N-1;s++) st.push({tr:agRingStep(s), cap:"环形第 "+(s+1)+"/3 步：每张卡把“刚拿到的那块”转发给顺时针下一张卡。每步每卡只发 1 块，所有链路同时忙碌。"});
+        return st; } },
+    reducescatter:{ name:"Reduce-scatter", ring:true,
+      code:"dist.reduce_scatter_tensor(output, input, op=SUM)",
+      init:function(){ var s=emptyState(); for (var r=0;r<N;r++) for (var j=0;j<N;j++) s[r][j]=cell(r+j,j,r); return s; },
+      intro:"开始：rank r 持有 [r, r+1, r+2, r+3]（想象成每张卡在自己那份数据上算出的完整梯度）。",
+      steps:function(ring){
+        var after=function(s){ clearNonOwned(s); };
+        if (!ring) return [{tr:rsLogical(), after:after, cap:"第 i 块由所有 rank 求和后只存到 rank i：得到 6、10、14、18 分别落在 rank 0~3。其余块用完即丢。用途：反向后对梯度求和，但每张卡只保存自己负责的那一片。"}];
+        var st=[]; for (var s=0;s<N-1;s++){ var x={tr:rsRingStep(s), cap:"环形第 "+(s+1)+"/3 步：每张卡把一块“部分和”发给下一张卡，对方把它加到自己的同一块上（看小圆点在变多）。"}; if (s===N-2){ x.after=after; x.cap += " 三步后每块都集齐了 4 张卡的贡献，各自留在一张卡上。"; } st.push(x); }
+        return st; } },
+    allreduce:{ name:"All-reduce", ring:true,
+      code:"dist.all_reduce(tensor, op=dist.ReduceOp.SUM)",
+      init:function(){ var s=emptyState(); for (var r=0;r<N;r++) for (var j=0;j<N;j++) s[r][j]=cell(r+j,j,r); return s; },
+      intro:"开始：与 reduce-scatter 相同的输入。目标：每张卡都得到求和后的完整结果 [6,10,14,18]。",
+      steps:function(ring){
+        var after=function(s){ clearNonOwned(s); };
+        if (!ring) return [
+          {tr:rsLogical(), after:after, cap:"阶段 1 = reduce-scatter：每块求和后落在一张卡上。"},
+          {tr:agLogical(), cap:"阶段 2 = all-gather：再把求和结果广播给所有人。all-reduce = reduce-scatter + all-gather！DDP 正是用它来同步梯度。"} ];
+        var st=[]; for (var s=0;s<N-1;s++){ var x={tr:rsRingStep(s), cap:"阶段 1 reduce-scatter，环形第 "+(s+1)+"/3 步：传递并累加部分和。"}; if (s===N-2) x.after=after; st.push(x); }
+        for (var s2=0;s2<N-1;s2++) st.push({tr:agRingStep(s2), cap:"阶段 2 all-gather，环形第 "+(s2+1)+"/3 步：把完整的和沿环传开。"+(s2===N-2?" 完成！每卡共发出 6 块 = 2(N−1)/N 份张量。":"")});
+        return st; } },
+    alltoall:{ name:"All-to-all", ring:false,
+      code:"dist.all_to_all_single(output, input)",
+      init:function(){ var s=emptyState(); for (var r=0;r<N;r++) for (var j=0;j<N;j++) s[r][j]=cell(4*r+j,r,r); return s; },
+      intro:"开始：rank r 持有 [4r, 4r+1, 4r+2, 4r+3]，第 j 个位置的数要发给 rank j（颜色表示来源 rank）。",
+      steps:function(){ var tr=[]; for (var r=0;r<N;r++) for (var j=0;j<N;j++) if (r!==j) tr.push(T(r,j,j,r,"move"));
+        return [{tr:tr, cap:"每张卡给每张卡各发一块，结果像矩阵转置：rank 0 收到 [0,4,8,12]。MoE 里把 token 路由到不同专家所在的卡，用的就是它。"}]; } }
+  };
+  var ORDER = ["broadcast","scatter","gather","reduce","allgather","reducescatter","allreduce","alltoall"];
+
+  // ---- 状态 ----
+  var cur = "allreduce", ring = false, steps = [], idx = 0, history = [], state = null, sent = [0,0,0,0], busy = false, playing = false, playTimer = null;
+
+  // ---- 画静态背景 ----
+  var gBg = el("g",{},stage), gCells = el("g",{},stage), gChips = el("g",{},stage);
+  function drawBackground(){
+    while (gBg.firstChild) gBg.removeChild(gBg.firstChild);
+    if (!ring){
+      for (var r=0;r<N;r++){ var b=BOX[r]; var cx=b.x+BW/2, cy=(r<2)?b.y+BH:b.y; el("line",{x1:cx,y1:cy,x2:280,y2:200,stroke:"var(--sw)","stroke-width":"3"},gBg); }
+      el("rect",{x:230,y:175,width:100,height:50,rx:8,fill:"var(--sw)"},gBg);
+      var t=el("text",{x:280,y:205,"text-anchor":"middle","font-size":"13",fill:"var(--fg)"},gBg); t.textContent="NVSwitch";
+    } else {
+      var pts=[[260,90,300,90],[430,160,430,240],[300,310,260,310],[130,240,130,160]];
+      el("defs",{},gBg).innerHTML='<marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>';
+      pts.forEach(function(p){ el("line",{x1:p[0],y1:p[1],x2:p[2],y2:p[3],stroke:"var(--accent)","stroke-width":"3","marker-end":"url(#ar)"},gBg); });
+      var t2=el("text",{x:280,y:205,"text-anchor":"middle","font-size":"13",fill:"var(--muted)"},gBg); t2.textContent="环：0→1→2→3→0";
+    }
+    for (var r2=0;r2<N;r2++){ var bb=BOX[r2];
+      el("rect",{x:bb.x,y:bb.y,width:BW,height:BH,rx:10,fill:"var(--gpu)",stroke:"var(--gpu-border)","stroke-width":"1.5"},gBg);
+      var tt=el("text",{x:bb.x+12,y:bb.y+24,"font-size":"14","font-weight":"600",fill:"var(--fg)"},gBg); tt.textContent="GPU "+r2+"（rank "+r2+"）";
+      for (var j=0;j<N;j++){ var p=slotPos(r2,j);
+        el("rect",{x:p.x-SL/2,y:p.y-SL/2,width:SL,height:SL,rx:6,fill:"none",stroke:"var(--line)","stroke-dasharray":"3 3"},gBg);
+        var lt=el("text",{x:p.x,y:p.y+SL/2+26,"text-anchor":"middle","font-size":"10",fill:"var(--muted)"},gBg); lt.textContent="块"+j; }
+    }
+  }
+  function drawCell(parent, x, y, c){
+    var g=el("g",{transform:"translate("+x+","+y+")"},parent);
+    el("rect",{x:-SL/2,y:-SL/2,width:SL,height:SL,rx:6,fill:colorVar(c.col)},g);
+    var t=el("text",{x:0,y:4,"text-anchor":"middle","font-size":"17","font-weight":"700",fill:"var(--chipText)"},g); t.textContent=String(c.v);
+    for (var k=0;k<N;k++) el("circle",{cx:-12+k*8,cy:SL/2-7,r:2.6,fill:c.c[k]?"#fff":"rgba(255,255,255,.3)"},g);
+    return g;
+  }
+  function render(){
+    while (gCells.firstChild) gCells.removeChild(gCells.firstChild);
+    for (var r=0;r<N;r++) for (var j=0;j<N;j++){ var c=state[r][j]; if (c){ var p=slotPos(r,j); drawCell(gCells,p.x,p.y,c); } }
+    var st=document.getElementById("stats"); st.innerHTML="";
+    for (var r2=0;r2<N;r2++){ var d=document.createElement("div"); d.className="stat"; d.innerHTML="GPU "+r2+" 已发出<b>"+sent[r2]+" 块</b>"; st.appendChild(d); }
+    document.getElementById("stepInfo").textContent="步骤 "+idx+" / "+steps.length;
+    document.getElementById("bPrev").disabled = idx===0 || busy;
+    document.getElementById("bStep").disabled = idx>=steps.length || busy;
+  }
+
+  function reset(){
+    stopPlay();
+    var op=OPS[cur]; if (!op.ring) ring=false;
+    document.getElementById("mLogic").className = ring?"":"on";
+    document.getElementById("mRing").className = ring?"on":"";
+    document.getElementById("mRing").disabled = !op.ring;
+    state=op.init(); steps=op.steps(ring); idx=0; history=[]; sent=[0,0,0,0];
+    while (gChips.firstChild) gChips.removeChild(gChips.firstChild);
+    drawBackground(); render();
+    document.getElementById("caption").textContent=op.intro;
+    document.getElementById("codeLine").innerHTML="PyTorch：<code>"+op.code+"</code>";
+    var bs=document.querySelectorAll("#ops button"); for (var i=0;i<bs.length;i++) bs[i].className = bs[i].dataset.k===cur?"on":"";
+  }
+
+  function ease(t){ return t<.5 ? 2*t*t : 1-Math.pow(-2*t+2,2)/2; }
+  function doStep(done){
+    if (busy || idx>=steps.length){ if(done) done(); return; }
+    busy=true;
+    var step=steps[idx];
+    history.push({state:clone(state), sent:sent.slice()});
+    var snap=clone(state);
+    // 发送方若是 move，先从格子里拿走
+    step.tr.forEach(function(t){ if (t.mode==="move") state[t.f][t.fs]=null; });
+    render();
+    var chips=step.tr.map(function(t){ var a=slotPos(t.f,t.fs), b=slotPos(t.t,t.ts); return {t:t,a:a,b:b,g:drawCell(gChips,a.x,a.y,snap[t.f][t.fs])}; });
+    var dur=900, t0=null;
+    function frame(ts){
+      if (t0===null) t0=ts; var k=Math.min(1,(ts-t0)/dur), e=ease(k);
+      chips.forEach(function(c){ var x=c.a.x+(c.b.x-c.a.x)*e, y=c.a.y+(c.b.y-c.a.y)*e - Math.sin(Math.PI*e)*18; c.g.setAttribute("transform","translate("+x+","+y+") scale(0.78)"); });
+      if (k<1){ requestAnimationFrame(frame); return; }
+      while (gChips.firstChild) gChips.removeChild(gChips.firstChild);
+      step.tr.forEach(function(t){
+        var src=snap[t.f][t.fs]; sent[t.f]++;
+        var d=state[t.t][t.ts];
+        if (t.mode==="add" && d){ d.v+=src.v; for (var q=0;q<N;q++) d.c[q]=d.c[q]||src.c[q]; }
+        else state[t.t][t.ts]={v:src.v,col:src.col,c:src.c.slice()};
+      });
+      if (step.after) step.after(state);
+      idx++; busy=false; render();
+      document.getElementById("caption").textContent=step.cap;
+      if (done) done();
+    }
+    requestAnimationFrame(frame);
+  }
+  function prev(){
+    if (busy || idx===0) return; stopPlay();
+    var h=history.pop(); state=h.state; sent=h.sent; idx--; render();
+    document.getElementById("caption").textContent = idx===0 ? OPS[cur].intro : steps[idx-1].cap;
+  }
+  function stopPlay(){ playing=false; if (playTimer){ clearTimeout(playTimer); playTimer=null; } document.getElementById("bPlay").textContent="▶ 自动播放"; }
+  function play(){
+    if (playing){ stopPlay(); return; }
+    if (idx>=steps.length) reset();
+    playing=true; document.getElementById("bPlay").textContent="⏸ 暂停";
+    (function loop(){ if (!playing) return; if (idx>=steps.length){ stopPlay(); return; }
+      doStep(function(){ if (playing) playTimer=setTimeout(loop, 900); }); })();
+  }
+
+  // ---- 按钮 ----
+  var opsDiv=document.getElementById("ops");
+  ORDER.forEach(function(k){ var b=document.createElement("button"); b.textContent=OPS[k].name; b.dataset.k=k; b.onclick=function(){ if(busy) return; cur=k; reset(); }; opsDiv.appendChild(b); });
+  document.getElementById("mLogic").onclick=function(){ if(busy) return; ring=false; reset(); };
+  document.getElementById("mRing").onclick=function(){ if(busy) return; if (OPS[cur].ring){ ring=true; reset(); } };
+  document.getElementById("bReset").onclick=function(){ if(!busy) reset(); };
+  document.getElementById("bStep").onclick=function(){ stopPlay(); doStep(); };
+  document.getElementById("bPrev").onclick=prev;
+  document.getElementById("bPlay").onclick=play;
+  reset();
+})();
+</script>
+</body>
+</html>

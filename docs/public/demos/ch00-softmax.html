@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Softmax 温度实验</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#6b7280;--card:#f5f7fa;--border:#d8dee4;--accent:#2563eb;--accent-soft:#dbeafe;--warn:#d97706;--warn-soft:#fef3c7;--good:#059669;--bad:#dc2626}
+@media (prefers-color-scheme: dark){:root{--bg:#16181d;--fg:#e6e8eb;--muted:#9aa3ae;--card:#1f232a;--border:#363c45;--accent:#60a5fa;--accent-soft:#1e3a5f;--warn:#fbbf24;--warn-soft:#4a3a12;--good:#34d399;--bad:#f87171}}
+*{box-sizing:border-box}
+select{max-width:100%}
+label{max-width:100%}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+body{padding:12px;overflow-x:hidden}
+h3{margin:0 0 6px;font-size:16px}
+.muted{color:var(--muted);font-size:12.5px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin:8px 0}
+button{font:inherit;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg);cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
+input[type=range]{flex:1;min-width:100px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:4px 4px;border-bottom:1px solid var(--border);text-align:right;white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+td.bar{width:38%;text-align:left}
+.barbox{height:16px;background:var(--bg);border:1px solid var(--border);border-radius:3px;overflow:hidden}
+.barfill{height:100%;background:var(--accent);transition:width .15s}
+tr.target .barfill{background:var(--good)}
+tr.target td:first-child{font-weight:700;color:var(--good)}
+.tok{display:flex;align-items:center;gap:6px}
+.tok input[type=range]{min-width:70px;max-width:130px}
+.stat{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:6px}
+.stat div{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 8px}
+.stat b{display:block;font-size:15px}
+.samples{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+.samples span{padding:1px 6px;border-radius:4px;background:var(--accent-soft);font-size:13px}
+@media (max-width:460px){ .hide-sm{display:none} td.bar{width:26%} .tok input[type=range]{min-width:60px;max-width:90px} th,td{padding:4px 2px} }
+</style>
+</head>
+<body>
+<h3>Softmax、温度、交叉熵与困惑度</h3>
+<div class="muted">句子“我家养了一只 ___”的下一个词候选。拖动每个词的 logit（模型原始打分），再调温度 T。点一行把它设为“正确答案”。</div>
+
+<div class="row">
+  <label>温度 T = <span id="tv" class="mono"></span></label>
+  <input id="temp" type="range" min="-2.3" max="1.61" step="0.01" value="0">
+</div>
+
+<div class="card" style="padding:6px 8px">
+<table>
+  <thead><tr><th>词</th><th>logit z</th><th class="hide-sm">z/T</th><th class="hide-sm">e^(z/T)</th><th>概率 p</th><th class="bar"></th></tr></thead>
+  <tbody id="tb"></tbody>
+</table>
+</div>
+
+<div class="card">
+  <div class="stat">
+    <div>正确答案<b id="sT"></b></div>
+    <div>p(正确)<b id="sP" class="mono"></b></div>
+    <div>交叉熵 −ln p<b id="sL" class="mono"></b></div>
+    <div>困惑度 e^loss<b id="sPPL" class="mono"></b></div>
+  </div>
+  <div class="muted" style="margin-top:6px">交叉熵只看“正确答案拿到了多少概率”。p=1 时损失为 0；p 越小损失越大。困惑度 = e^损失，可以理解为“模型相当于在几个选项里瞎猜”。均匀分布在 5 个词上时困惑度正好是 5。</div>
+</div>
+
+<div class="card">
+  <div class="row"><button id="s1" class="primary">按概率采样 1 次</button><button id="s20">采样 20 次</button><button id="sclr">清空</button><button id="uni">设为均匀分布</button></div>
+  <div class="samples" id="smp"></div>
+  <div class="muted" id="cnt"></div>
+</div>
+<div class="muted">观察：T 越小，最高分的词越“独占”概率（接近只选最大值）；T 越大，分布越平均、采样越“有创意”。所有 logit 同时加同一个数，概率不变——softmax 只关心相对差距。</div>
+
+<script>
+(function(){
+  var words=['猫','狗','鱼','仓鼠','汽车'];
+  var logits=[2.0,1.5,0.3,-0.5,-3.0];
+  var target=0, samples=[];
+  var $=function(id){return document.getElementById(id);};
+  function T(){return Math.exp(+$('temp').value);}
+  function softmax(z,t){ var m=-Infinity; z.forEach(function(v){m=Math.max(m,v/t);}); var e=z.map(function(v){return Math.exp(v/t-m);}); var s=e.reduce(function(a,b){return a+b;},0); return {p:e.map(function(v){return v/s;}), e:z.map(function(v){return Math.exp(v/t);})}; }
+  function f(v,d){ if(!isFinite(v)) return v>0?'很大':'0'; if(Math.abs(v)>=1e5||(Math.abs(v)<1e-3&&v!==0)) return v.toExponential(2); return v.toFixed(d===undefined?3:d); }
+  function build(){
+    var tb=$('tb'); tb.innerHTML='';
+    words.forEach(function(w,i){
+      var tr=document.createElement('tr'); tr.id='r'+i; tr.style.cursor='pointer';
+      tr.innerHTML='<td><div class="tok"><span style="min-width:2.6em">'+w+'</span><input type="range" min="-5" max="5" step="0.1" value="'+logits[i]+'" id="z'+i+'"></div></td><td class="mono" id="zv'+i+'"></td><td class="mono hide-sm" id="zt'+i+'"></td><td class="mono hide-sm" id="ez'+i+'"></td><td class="mono" id="p'+i+'"></td><td class="bar"><div class="barbox"><div class="barfill" id="b'+i+'"></div></div></td>';
+      tb.appendChild(tr);
+      tr.addEventListener('click',function(e){ if(e.target.tagName==='INPUT') return; target=i; update(); });
+      tr.querySelector('input').addEventListener('input',function(){ logits[i]=+this.value; update(); });
+    });
+  }
+  function update(){
+    var t=T(); $('tv').textContent=t.toFixed(2);
+    var r=softmax(logits,t);
+    words.forEach(function(w,i){
+      $('zv'+i).textContent=logits[i].toFixed(1);
+      $('zt'+i).textContent=f(logits[i]/t,2);
+      $('ez'+i).textContent=f(r.e[i],2);
+      $('p'+i).textContent=f(r.p[i]);
+      $('b'+i).style.width=(r.p[i]*100).toFixed(1)+'%';
+      $('r'+i).className=(i===target)?'target':'';
+    });
+    var p=r.p[target], L=-Math.log(Math.max(p,1e-300));
+    $('sT').textContent=words[target]; $('sP').textContent=f(p); $('sL').textContent=f(L); $('sPPL').textContent=f(Math.exp(L),2);
+    renderSamples();
+  }
+  function sample(){ var r=softmax(logits,T()).p, u=Math.random(), c=0; for(var i=0;i<r.length;i++){c+=r[i]; if(u<c) return i;} return r.length-1; }
+  function renderSamples(){
+    $('smp').innerHTML=samples.slice(-60).map(function(i){return '<span>'+words[i]+'</span>';}).join('');
+    if(!samples.length){$('cnt').textContent='';return;}
+    var c=words.map(function(){return 0;}); samples.forEach(function(i){c[i]++;});
+    $('cnt').textContent='共 '+samples.length+' 次：'+words.map(function(w,i){return w+' '+c[i];}).join('，');
+  }
+  $('s1').onclick=function(){samples.push(sample()); renderSamples();};
+  $('s20').onclick=function(){for(var k=0;k<20;k++)samples.push(sample()); renderSamples();};
+  $('sclr').onclick=function(){samples=[]; renderSamples();};
+  $('uni').onclick=function(){ logits=logits.map(function(){return 0;}); words.forEach(function(w,i){$('z'+i).value=0;}); update(); };
+  $('temp').oninput=update;
+  build(); update();
+})();
+</script>
+</body>
+</html>

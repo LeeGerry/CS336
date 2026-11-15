@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>预训练数据集年表</title>
+<style>
+:root{
+  --bg:#ffffff; --fg:#1f2328; --muted:#656d76; --card:#f6f8fa; --border:#d0d7de;
+  --accent:#3b6fd8; --rule:#2f8f6b; --model:#c2581c; --mix:#7a5cc7; --src:#5b6f8a; --grid:#e6e9ed;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#16181d; --fg:#e6e8eb; --muted:#9aa4b2; --card:#20242b; --border:#363c46;
+    --accent:#7aa2ff; --rule:#56c79b; --model:#f08a4b; --mix:#a98cf0; --src:#8fa3c0; --grid:#2a2f37;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+h1{font-size:16px;margin:0 0 8px}
+.row{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin:6px 0}
+button{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:3px 8px;cursor:pointer}
+button.on{border-color:var(--accent);color:var(--accent);font-weight:600}
+.small{font-size:12px;color:var(--muted)}
+.item{display:grid;grid-template-columns:44px 112px 1fr;gap:6px;align-items:center;padding:3px 2px;border-radius:6px;cursor:pointer}
+.item:hover{background:var(--grid)}
+.item.sel{outline:2px solid var(--accent)}
+.yr{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
+.nm{font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.track{position:relative;height:16px}
+.bar{position:absolute;left:0;top:2px;height:12px;border-radius:3px}
+.lbl{position:absolute;top:0;font-size:11px;white-space:nowrap}
+.dot{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:3px;vertical-align:-1px}
+.axis{display:grid;grid-template-columns:44px 112px 1fr;gap:6px;font-size:11px;color:var(--muted)}
+.axis .ticks{position:relative;height:14px}
+.axis .ticks span{position:absolute;transform:translateX(-50%)}
+.kv{display:grid;grid-template-columns:72px 1fr;gap:2px 8px;font-size:13px}
+.kv b{color:var(--muted);font-weight:500}
+</style>
+</head>
+<body>
+<h1>预训练数据集演化（2019 → 2025）：来源、规模、怎么过滤</h1>
+<div class="row" id="filters"></div>
+<div class="row small">
+  <span><span class="dot" style="background:var(--rule)"></span>规则过滤为主</span>
+  <span><span class="dot" style="background:var(--model)"></span>模型（分类器）过滤</span>
+  <span><span class="dot" style="background:var(--mix)"></span>规则 + 模型 / 合成数据</span>
+  <span><span class="dot" style="background:var(--src)"></span>精选来源 / 无大规模过滤</span>
+</div>
+<div class="row"><span class="small">排序：</span><button id="sYear" class="on">按时间</button><button id="sSize">按规模</button></div>
+<div class="card">
+  <div class="axis"><span></span><span></span><div class="ticks" id="ticks"></div></div>
+  <div id="list"></div>
+  <div class="small">条形长度：token 数（对数刻度）。只画课上给出了 token 数或可由课上数字直接换算的条目；没有条形的条目表示课上只给了 GB/TB/页数等其他单位；灰色条是两个前沿模型的训练 token 数，作对比。</div>
+</div>
+<div class="card" id="detail"><span class="small">点击任意一行查看细节。</span></div>
+
+<script>
+(function(){
+// tokens: number or null. All numbers are the ones quoted in lecture 13.
+const D = [
+  {y:2019, n:'BERT 数据', t:null, k:'src', size:'Wikipedia + BooksCorpus（7K 本书，9.85 亿词）', src:'Wikipedia、Smashwords 上的免费自出版书', filt:'—', dedup:'—', idea:'训练序列是“文档”而不是“句子”。BooksCorpus 后来因违反 Smashwords 服务条款被下架。'},
+  {y:2019, n:'WebText (GPT-2)', t:null, k:'src', size:'800 万网页，40 GB', src:'Reddit 帖子中 karma ≥ 3 的外链', filt:'用 Reddit 投票当“质量代理”', dedup:'—', idea:'好帖子链向好网页。未公开；OpenWebText 是开源复现（fastText 去非英语 + 近似去重）。'},
+  {y:2019, n:'CCNet', t:null, k:'model', size:'工具 + 数据集（课上未给 token 数）', src:'Common Crawl', filt:'fastText 语言识别；KenLM 5-gram 模型（在 Wikipedia 上训练）打分，保留“像维基”的文档', dedup:'段落级去重（轻度规范化）', idea:'自动化、可用于低资源语言；训出的 BERT 超过只用 Wikipedia 的版本。'},
+  {y:2019, n:'C4 (T5)', t:156e9, k:'rule', size:'806 GB，1560 亿 token（起点：一个 1.4T token 的 CC 快照）', src:'Common Crawl 2019 年 4 月快照', filt:'行以标点结尾且 ≥ 5 词；页面 ≥ 3 句；去脏词；含 “{”、lorem ipsum、terms of use 的去掉；langdetect 英文概率 0.99', dedup:'3 句窗口精确去重', idea:'“Common Crawl 大部分不是有用的自然语言”——用手写规则也能拿到大而干净的子集。'},
+  {y:2020, n:'GPT-3 数据', t:400e9, k:'model', size:'570 GB，4000 亿 token', src:'处理过的 CC + WebText2 + Books1/Books2（神秘） + Wikipedia', filt:'质量分类器：{WebText, Wikipedia, Books1, Books2} 为正例，其余为负例', dedup:'文档级模糊去重（含 WebText 与评测集）', idea:'“用分类器筛 CC”的开端之一。'},
+  {y:2021, n:'The Pile', t:275e9, k:'src', size:'825 GB，约 2750 亿 token', src:'22 个高质量领域：Pile-CC、PubMed Central、arXiv、GitHub、Enron 邮件、Gutenberg、Books3、StackExchange…', filt:'Pile-CC 用 WARC + jusText 抽取（比 WET 好）', dedup:'—', idea:'EleutherAI 志愿者在 Discord 上协作，对 GPT-3 的开源回应。Books3 来自影子图书馆，后被下架。'},
+  {y:2021, n:'MassiveText (Gopher)', t:null, k:'rule', size:'10.5 TB 文本（Gopher 只训了 3000 亿 token，约 12%）', src:'MassiveWeb + C4 + 书 + 新闻 + GitHub + Wikipedia', filt:'手写规则（如 80% 的词至少含一个字母）；用 Google SafeSearch 而非词表过滤有害内容', dedup:'去重 + 训练/测试重叠检测', idea:'刻意不用分类器，便于控制。数据描述写得很细。'},
+  {y:2023, n:'LLaMA 数据', t:1.2e12, k:'model', size:'1.2T token', src:'CC（CCNet 处理）+ C4 + GitHub（宽松许可）+ Wikipedia（20 种语言）+ Gutenberg + Books3 + arXiv（LaTeX）+ StackExchange', filt:'分类器判断“是否被 Wikipedia 引用的页面”', dedup:'—', idea:'最后一批详细公开数据处理的大模型之一；公开用了 Books3 惹上麻烦。RedPajama v1 复现了它。'},
+  {y:2023, n:'SlimPajama', t:627e9, k:'src', size:'6270 亿 token', src:'RedPajama v1 的子集', filt:'—', dedup:'MinHash LSH 去重', idea:'光靠去重就砍掉一大块。'},
+  {y:2023, n:'RefinedWeb', t:600e9, k:'rule', size:'共 5T token，公开 6000 亿', src:'只用 Common Crawl（WARC）', filt:'trafilatura 抽取正文；Gopher 规则；刻意避开 ML 过滤以免引入偏差', dedup:'5-gram MinHash 模糊去重', idea:'“网页数据就够了”。'},
+  {y:2024, n:'FineWeb', t:15e12, k:'rule', size:'15T token，95 个 CC dump', src:'Common Crawl', filt:'URL 过滤；语言识别 p(en) > 0.65；Gopher + C4 + 更多规则', dedup:'MinHash 模糊去重', idea:'RefinedWeb 的改进复现；匿名化邮箱和公网 IP（PII）。'},
+  {y:2024, n:'Dolma', t:3e12, k:'rule', size:'3T token', src:'CC + The Stack + C4 + Reddit（Pushshift）+ peS2o（4000 万篇论文）+ Gutenberg + Wikipedia/Wikibooks', filt:'fastText 语言识别；Gopher/C4 规则（避开模型质量过滤）；规则 + Jigsaw 分类器去有害内容', dedup:'Bloom filter 去重', idea:'AI2 的完全开放数据集。'},
+  {y:2024, n:'DCLM-baseline', t:3.8e12, k:'model', size:'DCLM-pool 240T token → baseline 3.8T token', src:'Common Crawl', filt:'规则 + 去重 + fastText 质量分类器：正例 20 万条 = OpenHermes-2.5（多为 GPT-4 生成的指令数据）+ ELI5（Reddit 问答），负例 20 万条 = RefinedWeb', dedup:'有（规则之后、分类器之前）', idea:'模型过滤成为主流的转折点；这个“奇怪”的分类器效果出奇地好。'},
+  {y:2024, n:'Nemotron-CC', t:6.3e12, k:'mix', size:'6.3T token（高质量子集 1.1T）', src:'Common Crawl', filt:'jusText 抽取（token 更多）；分类器集成：Nemotron-340B 打“教育价值”分再蒸馏 + DCLM 分类器', dedup:'课上未展开', idea:'DCLM/FineWeb-Edu 删得太狠（约 90%）。低质量数据用 LM 改写，高质量数据用 LM 生成问答等任务——合成数据进入预训练。'},
+  {y:2022, n:'The Stack', t:null, k:'src', size:'3.1 TB 代码（1.37 亿仓库，510 亿文件，其中仅 50 亿唯一）', src:'GitHub Archive 中的仓库名 → git clone', filt:'只保留宽松许可（MIT、Apache），go-license-detector', dedup:'MinHash + Jaccard 近似去重', idea:'Stack v2（2024）再加入 issue/PR/评论、Software Heritage、文档，以及 LLVM 中间表示配对。'},
+  {y:2025, n:'Common Pile', t:null, k:'src', size:'8 TB', src:'只收宽松许可/公有领域：Stack v2、政府文件、wiki、部分新闻、论文、论坛、教育资源…', filt:'许可证审查（要防“许可证洗白”）；不用合成数据', dedup:'—', idea:'只用合法授权数据能做到多好？能做得不错，但 token 不够多时很难与前沿竞争。'},
+  {y:2024, n:'参考：Llama 3 训练量', t:15e12, k:'ref', size:'15T token', src:'—', filt:'—', dedup:'—', idea:'论文里的 token 数可能包含重复的 epoch，比较时要小心。'},
+  {y:2025, n:'参考：Qwen3 训练量', t:36e12, k:'ref', size:'36T token', src:'—', filt:'—', dedup:'—', idea:'同上：训练 token ≠ 唯一 token。'}
+];
+const COL = {rule:'var(--rule)', model:'var(--model)', mix:'var(--mix)', src:'var(--src)', ref:'var(--muted)'};
+const KNAME = {rule:'规则过滤为主', model:'模型过滤', mix:'规则 + 模型 / 合成', src:'精选来源 / 无大规模过滤', ref:'参考线'};
+const FILTERS = [['all','全部'],['rule','规则'],['model','模型'],['mix','混合/合成'],['src','精选来源']];
+let flt = 'all', sortBy = 'year', sel = null;
+const lo = 11, hi = 13.7; // log10 range: 100B .. ~50T
+const pos = t => Math.max(0.02, Math.min(1, (Math.log10(t) - lo) / (hi - lo))) * 100;
+function fmt(t){ return t >= 1e12 ? (t/1e12) + 'T' : (t/1e9) + 'B'; }
+
+function renderFilters(){
+  const el = document.getElementById('filters'); el.innerHTML = '<span class="small">筛选：</span>';
+  FILTERS.forEach(([k,lab])=>{ const b = document.createElement('button'); b.textContent = lab; if (k===flt) b.className = 'on'; b.onclick = ()=>{ flt = k; renderFilters(); render(); }; el.appendChild(b); });
+}
+function render(){
+  const ticks = document.getElementById('ticks');
+  ticks.innerHTML = [1e11, 1e12, 1e13].map(t=>'<span style="left:' + pos(t) + '%">' + fmt(t) + '</span>').join('');
+  let rows = D.map((d,i)=>({...d, i})).filter(d=>flt==='all' || d.k===flt || d.k==='ref');
+  rows.sort(sortBy==='year' ? (a,b)=>a.y-b.y || (a.t||0)-(b.t||0) : (a,b)=>(b.t||0)-(a.t||0));
+  document.getElementById('list').innerHTML = rows.map(d=>{
+    const w = d.t ? pos(d.t) : 0;
+    const bar = d.t ? '<div class="bar" style="width:' + w + '%;background:' + COL[d.k] + (d.k==='ref' ? ';opacity:.45' : '') + '"></div><span class="lbl" style="left:calc(' + Math.min(w, 80) + '% + 4px)">' + fmt(d.t) + '</span>'
+                    : '<span class="lbl small" style="left:0">' + d.size.split('（')[0] + '</span>';
+    return '<div class="item' + (sel===d.i?' sel':'') + '" data-i="' + d.i + '"><span class="yr">' + d.y + '</span><span class="nm" style="color:' + COL[d.k] + '">' + d.n + '</span><div class="track">' + bar + '</div></div>';
+  }).join('');
+  document.querySelectorAll('.item').forEach(n=>n.onclick = ()=>{ sel = +n.dataset.i; render(); showDetail(); });
+}
+function showDetail(){
+  const d = D[sel];
+  document.getElementById('detail').innerHTML = '<div style="font-weight:700;margin-bottom:4px">' + d.n + '（' + d.y + '）<span class="small"> · ' + KNAME[d.k] + '</span></div>' +
+    '<div class="kv"><b>规模</b><span>' + d.size + '</span><b>来源</b><span>' + d.src + '</span><b>过滤</b><span>' + d.filt + '</span><b>去重</b><span>' + d.dedup + '</span><b>要点</b><span>' + d.idea + '</span></div>';
+}
+document.getElementById('sYear').onclick = ()=>{ sortBy='year'; document.getElementById('sYear').className='on'; document.getElementById('sSize').className=''; render(); };
+document.getElementById('sSize').onclick = ()=>{ sortBy='size'; document.getElementById('sSize').className='on'; document.getElementById('sYear').className=''; render(); };
+renderFilters(); render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>作业路线规划器</title>
+<style>
+:root{
+  --bg:#ffffff; --fg:#1f2328; --muted:#656d76; --card:#f6f8fa; --border:#d0d7de;
+  --accent:#3b6fd8; --mac:#2e7d32; --gpu:#c2581c; --paper:#7a5cc7; --api:#8a8f98; --grid:#e6e9ed;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#16181d; --fg:#e6e8eb; --muted:#9aa4b2; --card:#20242b; --border:#363c46;
+    --accent:#7aa2ff; --mac:#6fd17a; --gpu:#f08a4b; --paper:#a98cf0; --api:#8f96a3; --grid:#2a2f37;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+h1{font-size:16px;margin:0 0 8px}
+.row{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin:6px 0}
+button{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 8px;cursor:pointer}
+button.on{border-color:var(--accent);color:var(--accent);font-weight:600}
+.small{font-size:12px;color:var(--muted)}
+.item{display:grid;grid-template-columns:22px 1fr auto;gap:6px;align-items:start;padding:5px 2px;border-bottom:1px solid var(--border)}
+.item.no{opacity:.5}
+.item .nm{font-weight:600;font-size:13px}
+.item .ds{font-size:12px;color:var(--muted)}
+.badge{display:inline-block;padding:0 6px;border-radius:999px;font-size:11px;font-weight:700;color:#fff;white-space:nowrap;margin-left:2px}
+.b-mac{background:var(--mac)} .b-gpu{background:var(--gpu)} .b-paper{background:var(--paper)} .b-api{background:var(--api)}
+.bar{display:flex;height:14px;border-radius:4px;overflow:hidden;background:var(--grid);margin:4px 0}
+.bar div{height:100%}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:6px}
+.stat b{display:block;font-size:18px}
+input[type=checkbox]{margin-top:3px}
+</style>
+</head>
+<body>
+<h1>作业路线规划器：我的硬件能做哪些题？</h1>
+<div class="row"><span class="small">我的条件：</span>
+  <button data-h="mac" class="on">只有 Mac</button>
+  <button data-h="cloud">Mac + 租 GPU（Modal 等）</button>
+  <button data-h="stanford">选课学生（+ A3 训练 API）</button>
+</div>
+<div class="row small">
+  <span><span class="badge b-mac">本地</span> Mac CPU/MPS 可完成（含单测）</span>
+  <span><span class="badge b-gpu">GPU</span> 需要 NVIDIA GPU</span>
+  <span><span class="badge b-paper">纸笔</span> 推导/文字题</span>
+  <span><span class="badge b-api">API</span> 需斯坦福训练 API</span>
+</div>
+<div class="row" id="tabs"></div>
+<div class="card">
+  <div class="stats">
+    <div class="stat"><span class="small">本作业可完成的分值</span><b id="pts"></b></div>
+    <div class="stat"><span class="small">已勾选完成</span><b id="done"></b></div>
+  </div>
+  <div class="bar" id="bar"></div>
+  <div class="small" id="hint"></div>
+</div>
+<div class="card" id="list"></div>
+<div class="small">分值与分类依据各作业说明 PDF（Spring 2026 版）。“本地”表示核心代码与单测可在 Mac 上完成；其中的正式规模实验仍建议上 GPU。勾选状态只保存在当前页面，刷新后清空。</div>
+
+<script>
+(function(){
+// t: mac | gpu | paper | api ; p: points ; c: chapter ; d: description
+const A = {
+  A1: {title:'A1 basics', items:[
+    {n:'unicode1 / unicode2', p:4, t:'paper', c:'第 1 章', d:'Unicode 与 UTF-8 理解题'},
+    {n:'train_bpe', p:15, t:'mac', c:'第 1 章', d:'字节级 BPE 训练；tests/test_train_bpe.py'},
+    {n:'train_bpe_tinystories / owt', p:4, t:'mac', c:'第 1 章', d:'在两个数据集上训练分词器并分析'},
+    {n:'tokenizer', p:15, t:'mac', c:'第 1 章', d:'encode / decode / encode_iterable；tests/test_tokenizer.py'},
+    {n:'tokenizer_experiments', p:4, t:'mac', c:'第 1 章', d:'压缩率、吞吐、把数据集编码成 uint16'},
+    {n:'linear / embedding / rmsnorm', p:3, t:'mac', c:'第 2、3 章', d:'基础模块与初始化'},
+    {n:'positionwise_feedforward / rope', p:4, t:'mac', c:'第 3 章', d:'SwiGLU、旋转位置编码'},
+    {n:'softmax / scaled_dot_product_attention', p:6, t:'mac', c:'第 0、3 章', d:'数值稳定 softmax、带掩码注意力'},
+    {n:'multihead_self_attention', p:5, t:'mac', c:'第 3 章', d:'因果多头自注意力（含 RoPE）'},
+    {n:'transformer_block / transformer_lm', p:6, t:'mac', c:'第 3 章', d:'Pre-norm 块与完整 LM'},
+    {n:'transformer_accounting', p:5, t:'paper', c:'第 2 章', d:'参数量、FLOPs、显存手算'},
+    {n:'cross_entropy / learning_rate_tuning', p:2, t:'mac', c:'第 0 章', d:'交叉熵；SGD 学习率小实验'},
+    {n:'adamw / adamw_accounting', p:4, t:'mac', c:'第 2 章', d:'AdamW 实现与资源核算'},
+    {n:'lr schedule / gradient_clipping', p:2, t:'mac', c:'第 2、11 章', d:'余弦 + warmup；全局范数裁剪'},
+    {n:'data_loading / checkpointing', p:3, t:'mac', c:'第 2 章', d:'随机 batch 采样；保存/恢复'},
+    {n:'training_together / decoding', p:7, t:'mac', c:'第 2、10 章', d:'训练脚本；温度与 top-p 采样'},
+    {n:'experiment_log / learning_rate / batch_size / generate', p:8, t:'mac', c:'第 2、9 章', d:'TinyStories 实验（低资源配置可在 Mac 上跑，正式配置约 1 块 B200 半小时/次）'},
+    {n:'消融：RMSNorm / post-norm / NoPE / SwiGLU', p:4, t:'mac', c:'第 3 章', d:'建议在 TinyStories 上缩小规模做'},
+    {n:'main_experiment（OWT）', p:2, t:'gpu', c:'第 9 章', d:'OpenWebText 训练（2 B200 小时）'},
+    {n:'leaderboard', p:6, t:'gpu', c:'全书', d:'45 分钟 B200 限时'}
+  ]},
+  A2: {title:'A2 systems', items:[
+    {n:'benchmarking_script', p:4, t:'gpu', c:'第 2、5 章', d:'计时前向/反向/优化器步（脚本可先在 CPU 上写）'},
+    {n:'nsys_profile', p:5, t:'gpu', c:'第 5、6 章', d:'Nsight Systems 只能用于 NVIDIA GPU'},
+    {n:'mixed_precision_accumulation', p:1, t:'mac', c:'第 5 章', d:'FP16/FP32 累加误差小实验'},
+    {n:'benchmarking_mixed_precision / memory_profiling', p:6, t:'gpu', c:'第 2、5 章', d:'autocast 与显存快照'},
+    {n:'gradient_checkpointing', p:4, t:'paper', c:'第 2、8 章', d:'推导最省显存策略（实测部分需 GPU）'},
+    {n:'pytorch_attention / torch_compile', p:4, t:'gpu', c:'第 6 章', d:'不同序列长度的耗时与 OOM'},
+    {n:'flash_forward (a) PyTorch 分块版', p:0, t:'mac', c:'第 6 章', d:'属于 flash_forward（共 15 分）的第 (a) 小题；test_flash_forward_pass_pytorch 可在 CPU 跑'},
+    {n:'flash_forward（含 (b)(c) Triton 内核 + 因果掩码）', p:15, t:'gpu', c:'第 6 章', d:'整题 15 分；Triton 测试无 CUDA 时自动跳过'},
+    {n:'flash_backward', p:5, t:'mac', c:'第 6 章', d:'PyTorch 版测试可在 CPU 跑；Triton 版需 CUDA'},
+    {n:'flash_benchmarking', p:5, t:'gpu', c:'第 6 章', d:'triton.testing.do_bench'},
+    {n:'distributed_communication_single_node', p:5, t:'gpu', c:'第 7 章', d:'all-reduce 基准（逻辑可用 gloo 在 CPU 调）'},
+    {n:'naive_ddp / ddp_overlap_individual_parameters（实现）', p:10, t:'mac', c:'第 7 章', d:'tests/test_ddp.py 用 gloo 在 CPU 跑'},
+    {n:'DDP 各项基准（朴素 / 扁平梯度 / 重叠）', p:6, t:'gpu', c:'第 7 章', d:'多 GPU 计时'},
+    {n:'optimizer_state_sharding', p:15, t:'mac', c:'第 8 章', d:'tests/test_sharded_optimizer.py（gloo）'},
+    {n:'fsdp', p:15, t:'mac', c:'第 8 章', d:'tests/test_fsdp.py（gloo）'},
+    {n:'sharding / fsdp accounting', p:10, t:'paper', c:'第 8 章', d:'显存与通信核算'},
+    {n:'并行分析：ring all-reduce / DP / FSDP / TP / 2D', p:17, t:'paper', c:'第 7、8 章', d:'纯推导题'},
+    {n:'leaderboard', p:10, t:'gpu', c:'全部', d:'2×B200，8B 模型 32K 上下文最快训练步'}
+  ]},
+  A3: {title:'A3 scaling', items:[
+    {n:'chinchilla_isoflops', p:5, t:'mac', c:'第 9 章', d:'用 data/isoflops_curves.json 离线拟合'},
+    {n:'scaling_laws（排行榜）', p:50, t:'api', c:'第 9、11 章', d:'12 B200 小时实验预算，通过斯坦福训练 API 提交'},
+    {n:'自学替代：用 A1 代码做迷你 IsoFLOPs 扫描', p:0, t:'mac', c:'第 9 章', d:'不计分，但能完整体验 规划→扫描→拟合→外推'}
+  ]},
+  A4: {title:'A4 data', items:[
+    {n:'look_at_cc', p:4, t:'mac', c:'第 13 章', d:'--offline-only 会下载一个示例 WARC/WET'},
+    {n:'extract_text', p:3, t:'mac', c:'第 14 章', d:'resiliparse；编码检测'},
+    {n:'language_identification', p:6, t:'mac', c:'第 14 章', d:'fastText lid.176.bin'},
+    {n:'mask_pii', p:3, t:'mac', c:'第 13 章', d:'邮箱 / 电话 / IPv4 正则'},
+    {n:'harmful_content', p:6, t:'mac', c:'第 14 章', d:'Dolma NSFW / 仇恨言论分类器'},
+    {n:'gopher_quality_filters', p:3, t:'mac', c:'第 13、14 章', d:'四条 Gopher 规则'},
+    {n:'quality_classifier', p:15, t:'mac', c:'第 14 章', d:'fastText 质量分类器（正例需抓取 Wikipedia 外链网页）'},
+    {n:'exact_deduplication', p:3, t:'mac', c:'第 14 章', d:'两遍扫描的行级去重'},
+    {n:'minhash_deduplication', p:8, t:'mac', c:'第 14 章', d:'MinHash + LSH + 复核 + 聚类'},
+    {n:'filter_data / inspect_filtered_data', p:10, t:'mac', c:'第 14 章', d:'小样本可本地；全量 2500 个 WET 建议云端多进程'},
+    {n:'tokenize_data', p:2, t:'mac', c:'第 1 章', d:'GPT-2 分词，uint16 二进制'},
+    {n:'train_model', p:8, t:'gpu', c:'第 14 章', d:'8×B200 约 2 小时'}
+  ]},
+  A5: {title:'A5 alignment', items:[
+    {n:'prompting_baselines', p:5, t:'gpu', c:'第 12、16 章', d:'vLLM 推理 GSM8K'},
+    {n:'baseline_calcs', p:5, t:'paper', c:'第 16 章', d:'策略梯度方差推导'},
+    {n:'GRPO 组件 ×6（分词、log-prob、奖励、组归一化、损失、聚合）', p:5.5, t:'mac', c:'第 16 章', d:'tests/test_grpo.py 用 tiny-gpt2 在 CPU 跑'},
+    {n:'grpo_train_step_standard_on_policy', p:5, t:'mac', c:'第 16 章', d:'单测在 CPU 跑'},
+    {n:'GRPO 实验：4 种子 / 学习率 / 提示词消融', p:16, t:'gpu', c:'第 16 章', d:'2×B200，各约 2~4 B200 小时'},
+    {n:'Dr. GRPO / RFT / MaxRL 思考与推导', p:11, t:'paper', c:'第 16 章', d:'长度归一化、拒绝采样微调、难度重加权'},
+    {n:'变体实现（组归一化/聚合/训练步）', p:4, t:'mac', c:'第 16 章', d:'对应单测可在 CPU 跑'},
+    {n:'变体对比实验', p:10, t:'gpu', c:'第 16 章', d:'8 B200 小时'},
+    {n:'离策略：推导与思考题', p:4, t:'paper', c:'第 16 章', d:'替代目标推导、重要性重加权思考'},
+    {n:'离策略：实现（token 级裁剪、GSPO、训练步）', p:4.5, t:'mac', c:'第 16 章', d:'对应单测可在 CPU 跑'},
+    {n:'离策略对比实验', p:10, t:'gpu', c:'第 16 章', d:'8 B200 小时'},
+    {n:'try_your_own', p:10, t:'gpu', c:'第 16 章', d:'自己设计策略梯度估计量'}
+  ]}
+};
+const OK = {mac:{mac:1,paper:1}, cloud:{mac:1,paper:1,gpu:1}, stanford:{mac:1,paper:1,gpu:1,api:1}};
+const LAB = {mac:'本地', gpu:'GPU', paper:'纸笔', api:'API'};
+const HINT = {
+  mac:'只用 Mac：先把所有“本地”和“纸笔”题做完；灰掉的题等租到 GPU 后集中完成。',
+  cloud:'Mac + 云 GPU：正确性在本地单测里解决，云上只跑计时、Triton 内核和正式实验。A3 的排行榜部分需要斯坦福 API，可用迷你扫描替代。',
+  stanford:'选课学生：全部可做。依旧建议先本地、后上云，节省排队和预算。'
+};
+let hw = 'mac', cur = 'A1';
+const done = {};
+function render(){
+  const tabs = document.getElementById('tabs'); tabs.innerHTML = '';
+  Object.keys(A).forEach(k=>{ const b = document.createElement('button'); b.textContent = A[k].title; if (k===cur) b.className = 'on'; b.onclick = ()=>{ cur = k; render(); }; tabs.appendChild(b); });
+  const items = A[cur].items;
+  let tot = 0, can = 0, dn = 0; const byT = {mac:0, paper:0, gpu:0, api:0};
+  let h = '';
+  items.forEach((it,i)=>{
+    const key = cur + i, ok = !!OK[hw][it.t];
+    tot += it.p; byT[it.t] += it.p; if (ok) can += it.p; if (done[key]) dn += it.p;
+    h += '<div class="item' + (ok ? '' : ' no') + '"><input type="checkbox" data-k="' + key + '"' + (done[key] ? ' checked' : '') + (ok ? '' : ' disabled') + '>' +
+      '<div><div class="nm">' + it.n + '</div><div class="ds">' + it.d + ' · ' + it.c + '</div></div>' +
+      '<div><span class="badge b-' + it.t + '">' + LAB[it.t] + '</span><div class="small" style="text-align:right">' + (it.p ? it.p + ' 分' : '—') + '</div></div></div>';
+  });
+  document.getElementById('list').innerHTML = h;
+  document.querySelectorAll('#list input').forEach(cb=>cb.onchange = ()=>{ done[cb.dataset.k] = cb.checked; render(); });
+  document.getElementById('pts').textContent = can + ' / ' + tot;
+  document.getElementById('done').textContent = dn + ' 分';
+  const col = {mac:'var(--mac)', paper:'var(--paper)', gpu:'var(--gpu)', api:'var(--api)'};
+  document.getElementById('bar').innerHTML = ['mac','paper','gpu','api'].map(t=>'<div title="' + LAB[t] + ' ' + byT[t] + ' 分" style="width:' + (tot ? byT[t]/tot*100 : 0) + '%;background:' + col[t] + (OK[hw][t] ? '' : ';opacity:.3') + '"></div>').join('');
+  document.getElementById('hint').textContent = HINT[hw];
+}
+document.querySelectorAll('[data-h]').forEach(b=>b.onclick = ()=>{ hw = b.dataset.h; document.querySelectorAll('[data-h]').forEach(x=>x.classList.toggle('on', x===b)); render(); });
+render();
+})();
+</script>
+</body>
+</html>

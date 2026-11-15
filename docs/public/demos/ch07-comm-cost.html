@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>梯度同步耗时计算器</title>
+<style>
+:root{ --bg:#ffffff; --panel:#f5f6f8; --fg:#1d2330; --muted:#667085; --line:#d0d5dd; --accent:#2563eb;
+  --comm:#ea580c; --comp:#16a34a; --track:#e5e7eb; }
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#111418; --panel:#1b2027; --fg:#e6e9ef; --muted:#98a2b3; --line:#344054; --accent:#60a5fa;
+    --comm:#f97316; --comp:#22c55e; --track:#2a313c; }
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;font-size:14px}
+.wrap{max-width:760px;margin:0 auto;padding:12px}
+h1{font-size:16px;margin:0 0 10px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 14px}
+@media (max-width:520px){ .grid{grid-template-columns:1fr} }
+label{display:block;font-size:12.5px;color:var(--muted);margin-bottom:2px}
+label b{color:var(--fg)}
+input[type=range]{width:100%}
+select{width:100%;font:inherit;padding:4px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--fg)}
+.card{background:var(--panel);border-radius:10px;padding:10px;margin-top:10px}
+.bars .row{display:grid;grid-template-columns:120px 1fr 92px;gap:8px;align-items:center;margin:5px 0;font-size:12.5px}
+@media (max-width:420px){ .bars .row{grid-template-columns:84px 1fr 74px;font-size:11.5px} }
+.track{background:var(--track);border-radius:4px;height:16px;position:relative;overflow:hidden}
+.fill{position:absolute;left:0;top:0;bottom:0;border-radius:4px}
+.sel{font-weight:700}
+.big{font-size:15px;line-height:1.7}
+.muted{color:var(--muted);font-size:12px;line-height:1.6}
+.formula{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;background:var(--track);padding:6px 8px;border-radius:6px;overflow-wrap:anywhere}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>数据并行：一次梯度 all-reduce 要多久？</h1>
+  <div class="grid">
+    <div><label>模型参数量：<b id="vP"></b></label><input id="P" type="range" min="0" max="100" value="45"></div>
+    <div><label>GPU 数量 N（数据并行的路数）：<b id="vN"></b></label><input id="N" type="range" min="1" max="10" value="2"></div>
+    <div><label>梯度精度</label><select id="dt"><option value="2">bf16（2 字节/参数）</option><option value="4">fp32（4 字节/参数）</option></select></div>
+    <div><label>GPU 之间的连接</label><select id="link"></select></div>
+    <div><label>每张卡每步处理的 token 数：<b id="vT"></b></label><input id="T" type="range" min="10" max="20" value="13"></div>
+    <div><label>MFU（实际算力利用率）：<b id="vM"></b></label><input id="M" type="range" min="10" max="70" value="40"></div>
+  </div>
+  <div class="card big" id="summary"></div>
+  <div class="card">
+    <div class="muted" style="margin-bottom:6px">同一份梯度，走不同“路”的 all-reduce 耗时（对数刻度；绿色竖线 = 这一步的计算耗时）</div>
+    <div class="bars" id="bars"></div>
+  </div>
+  <div class="card muted" id="explain"></div>
+</div>
+<script>
+(function(){
+  // 带宽（字节/秒），数字取自课程讲义的量级（单向有效带宽的粗略值）
+  var LINKS = [
+    {k:"hbm",  name:"（对照）HBM 显存", bw:8e12},
+    {k:"nvl",  name:"NVLink 5 / NVSwitch", bw:1.8e12},
+    {k:"pcie", name:"PCIe 7.0 x16", bw:242e9},
+    {k:"ib",   name:"InfiniBand", bw:50e9},
+    {k:"eth",  name:"普通以太网", bw:200e6}
+  ];
+  var GPU_FLOPS = 989e12; // H100 bf16 稠密峰值（讲义第 10 讲使用的数字）
+  var sel = document.getElementById("link");
+  LINKS.forEach(function(l,i){ if(i===0) return; var o=document.createElement("option"); o.value=l.k; o.textContent=l.name; sel.appendChild(o); });
+  sel.value="nvl";
+  function $(id){ return document.getElementById(id); }
+  function paramsFromSlider(v){ return Math.pow(10, 8 + v/100*4); } // 1e8 ~ 1e12
+  function fmtP(p){ return p>=1e12 ? (p/1e12).toFixed(2)+" T" : p>=1e9 ? (p/1e9).toFixed(p<1e10?1:0)+" B" : (p/1e6).toFixed(0)+" M"; }
+  function fmtB(b){ return b>=1e12?(b/1e12).toFixed(2)+" TB": b>=1e9?(b/1e9).toFixed(2)+" GB":(b/1e6).toFixed(1)+" MB"; }
+  function fmtT(s){ if (s>=3600) return (s/3600).toFixed(1)+" 小时"; if (s>=60) return (s/60).toFixed(1)+" 分钟"; if (s>=1) return s.toFixed(2)+" 秒"; if (s>=1e-3) return (s*1e3).toFixed(1)+" ms"; return (s*1e6).toFixed(0)+" µs"; }
+  function update(){
+    var P = paramsFromSlider(+$("P").value);
+    var N = Math.pow(2, +$("N").value);
+    var bytesPer = +$("dt").value;
+    var tokens = Math.pow(2, +$("T").value);
+    var mfu = +$("M").value/100;
+    $("vP").textContent = fmtP(P)+" 参数"; $("vN").textContent = N; $("vT").textContent = tokens.toLocaleString(); $("vM").textContent = Math.round(mfu*100)+"%";
+    var size = P*bytesPer;
+    var factor = 2*(N-1)/N;
+    var sentPerGpu = size*factor;
+    var compute = 6*P*tokens/(GPU_FLOPS*mfu);
+    var link = LINKS.filter(function(l){return l.k===sel.value;})[0];
+    var tComm = sentPerGpu/link.bw;
+    var ratio = tComm/compute;
+    var verdict = N===1 ? "只有 1 张卡，不需要通信。" :
+      ratio<0.3 ? "通信远小于计算：几乎“免费”，还可以和反向计算重叠藏起来。" :
+      ratio<1 ? "通信和计算同一量级：必须做通信-计算重叠，否则 GPU 会明显空等。" :
+      "通信比计算还慢：GPU 大部分时间在等网络，应换更快的互联或加大每卡 batch。";
+    $("summary").innerHTML =
+      "梯度大小 = "+fmtP(P)+" × "+bytesPer+" 字节 = <b>"+fmtB(size)+"</b><br>"+
+      "环形 all-reduce 每卡要发送 2(N−1)/N = "+factor.toFixed(3)+" 份 → <b>"+fmtB(sentPerGpu)+"</b><br>"+
+      "走 "+link.name+"（"+fmtB(link.bw)+"/s）：<b style='color:var(--comm)'>"+fmtT(tComm)+"</b>；"+
+      "这一步的计算（6 × 参数 × token / 有效算力）：<b style='color:var(--comp)'>"+fmtT(compute)+"</b><br>"+
+      "通信 / 计算 = <b>"+(N===1?"—":ratio.toFixed(2))+"</b>　"+verdict;
+    // 柱状图（对数刻度）
+    var bars=$("bars"); bars.innerHTML="";
+    var lo=Math.log10(1e-5), hi=Math.log10(1e5);
+    function pos(t){ return Math.max(0,Math.min(100,(Math.log10(Math.max(t,1e-9))-lo)/(hi-lo)*100)); }
+    LINKS.forEach(function(l){
+      var t = N===1?0:sentPerGpu/l.bw;
+      var r=document.createElement("div"); r.className="row"+(l.k===sel.value?" sel":"");
+      r.innerHTML="<div>"+l.name+"</div><div class='track'><div class='fill' style='width:"+(N===1?0:pos(t))+"%;background:var(--comm);opacity:"+(l.k===sel.value?1:.55)+"'></div>"+
+        "<div style='position:absolute;top:-2px;bottom:-2px;width:3px;background:var(--comp);left:calc("+pos(compute)+"% - 1px)'></div></div><div>"+(N===1?"—":fmtT(t))+"</div>";
+      bars.appendChild(r);
+    });
+    $("explain").innerHTML =
+      "<div class='formula'>t_comm ≈ 2·(N−1)/N · 参数量 · 每参数字节 ÷ 带宽</div>"+
+      "试试看：① 把 N 从 4 拉到 1024，通信时间几乎不变（2(N−1)/N 趋近 2），这就是讲义说的“有效带宽与卡数无关”。"+
+      "② 把连接从 NVLink 换成 InfiniBand，再换成以太网，看通信条一下子越过绿线。这就是为什么通信最密集的并行方式要放在节点内。"+
+      "③ 增大每卡 token 数：计算变长、通信不变，比例变好；这也是数据并行偏爱大 batch 的原因。"+
+      "<br>注：带宽取讲义中的量级，实际会受拓扑、消息大小、协议开销影响；计算时间按 H100 bf16 峰值 989 TFLOP/s 乘以 MFU 估算。";
+  }
+  ["P","N","dt","link","T","M"].forEach(function(id){ $(id).addEventListener("input",update); $(id).addEventListener("change",update); });
+  update();
+})();
+</script>
+</body>
+</html>
