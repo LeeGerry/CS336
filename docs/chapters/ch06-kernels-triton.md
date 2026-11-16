@@ -457,7 +457,7 @@ def naive_softmax(x):
     x = x - x_max[:, None]           # 读 MN + M，写 MN
     numerator = torch.exp(x)         # 读 MN，写 MN
     denominator = numerator.sum(dim=1)   # 读 MN，写 M
-    y = numerator / denominator[:, None] # 读 MN（+M），写 MN
+    y = numerator / denominator[:, None] # 读 MN，写 MN
     return y
     # 合计：约 5MN + M 次读，3MN + 2M 次写
     # 理想情况：只需 MN 次读、MN 次写 —— 差了约 4 倍

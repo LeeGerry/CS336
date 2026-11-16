@@ -137,7 +137,7 @@ $$
 
 ### 11.3.2 复现 Chinchilla，并准确预测最终损失
 
-DeepSeek 同样用了 WSD 式调度——一个小变化是**两段衰减**（各降 10%），讲者也不清楚为什么，这个做法后来也没流行起来 [▶ 20:15](https://www.youtube.com/watch?v=vTfEyOyzV9E&t=1215s)。他们用 IsoFLOP（Chinchilla 方法 2）做模型/数据权衡，得到的曲线比 MiniCPM 干净得多，成功复现了 Chinchilla 结论。讲者想借此说明：**Chinchilla 规律已经被其他人在相当大的算力范围上复现，这套分析总体可靠。**
+DeepSeek 同样用了 WSD 式调度——一个小变化是**两段阶梯式衰减**（各占训练的约 10%：训练到 80% 时降到峰值的 31.6%，到 90% 时再降到 10%），讲者也不清楚为什么，这个做法后来也没流行起来 [▶ 20:15](https://www.youtube.com/watch?v=vTfEyOyzV9E&t=1215s)。他们用 IsoFLOP（Chinchilla 方法 2）做模型/数据权衡，得到的曲线比 MiniCPM 干净得多，成功复现了 Chinchilla 结论。讲者想借此说明：**Chinchilla 规律已经被其他人在相当大的算力范围上复现，这套分析总体可靠。**
 
 最后是缩放定律工作的"终极卖点" [▶ 21:15](https://www.youtube.com/watch?v=vTfEyOyzV9E&t=1275s)：用一批精心设计的小模型画出幂律，外推到真正训练的 7B 和 67B，预测的最终损失与实际结果相当接近。讲者有点遗憾这样的图如今在开源论文里越来越少见了。
 

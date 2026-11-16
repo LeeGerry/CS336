@@ -324,7 +324,7 @@ $$h_t = \sum_{i=1}^{N} g_{i,t}\,\text{FFN}_i(u_t) + u_t$$
 > - 对 N 个专家的打分做 softmax 得到 `s_{i,t}`，只保留最高的 K 个作为门控权重 `g`，其余置 0。
 > - 输出是被选中专家输出的加权和，再加上残差 `u_t`。
 
-细节差异：DeepSeek V1/V2、Grok、Qwen 是**先 softmax 再 top-k**（如上）；Mixtral、DBRX、DeepSeek V3 是**先 top-k 再对选中的分数 softmax**。
+细节差异：DeepSeek V1/V2、Grok、Qwen 是**先 softmax 再 top-k**（如上）；Mixtral、DBRX 是**先 top-k 再对选中的分数 softmax**；DeepSeek V3 又换了一种：用 sigmoid 打分，取 top-k 后再把选中的分数归一化（见后文）。
 
 ```python
 import torch, torch.nn as nn, torch.nn.functional as F

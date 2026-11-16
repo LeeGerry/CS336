@@ -31,8 +31,8 @@ Percy 先抛出两个问题，读完本章你应该能自己算出来。
 
 ```python
 total_flops = 6 * 70e9 * 15e12        # 6ND = 6.3e24 FLOPs（6ND 的来历见 2.9 节）
-h100_flop_per_sec = 1979e12 / 2       # H100 bf16 稠密算力 ≈ 989.5 TFLOP/s（2.6 节解释为何除以 2）
-mfu = 0.5                              # 实际只能用到约一半（2.6 节解释 MFU）
+h100_flop_per_sec = 1979e12 / 2       # H100 bf16 稠密算力 ≈ 989.5 TFLOP/s（2.7 节解释为何除以 2）
+mfu = 0.5                              # 实际只能用到约一半（2.7 节解释 MFU）
 flops_per_day = h100_flop_per_sec * mfu * 1024 * 60 * 60 * 24   # ≈ 4.38e22
 days = total_flops / flops_per_day     # ≈ 144 天
 ```

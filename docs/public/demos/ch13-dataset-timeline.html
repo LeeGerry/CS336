@@ -61,7 +61,7 @@ button.on{border-color:var(--accent);color:var(--accent);font-weight:600}
 (function(){
 // tokens: number or null. All numbers are the ones quoted in lecture 13.
 const D = [
-  {y:2019, n:'BERT 数据', t:null, k:'src', size:'Wikipedia + BooksCorpus（7K 本书，9.85 亿词）', src:'Wikipedia、Smashwords 上的免费自出版书', filt:'—', dedup:'—', idea:'训练序列是“文档”而不是“句子”。BooksCorpus 后来因违反 Smashwords 服务条款被下架。'},
+  {y:2018, n:'BERT 数据', t:null, k:'src', size:'Wikipedia + BooksCorpus（7K 本书，9.85 亿词）', src:'Wikipedia、Smashwords 上的免费自出版书', filt:'—', dedup:'—', idea:'训练序列是“文档”而不是“句子”。BooksCorpus 后来因违反 Smashwords 服务条款被下架。'},
   {y:2019, n:'WebText (GPT-2)', t:null, k:'src', size:'800 万网页，40 GB', src:'Reddit 帖子中 karma ≥ 3 的外链', filt:'用 Reddit 投票当“质量代理”', dedup:'—', idea:'好帖子链向好网页。未公开；OpenWebText 是开源复现（fastText 去非英语 + 近似去重）。'},
   {y:2019, n:'CCNet', t:null, k:'model', size:'工具 + 数据集（课上未给 token 数）', src:'Common Crawl', filt:'fastText 语言识别；KenLM 5-gram 模型（在 Wikipedia 上训练）打分，保留“像维基”的文档', dedup:'段落级去重（轻度规范化）', idea:'自动化、可用于低资源语言；训出的 BERT 超过只用 Wikipedia 的版本。'},
   {y:2019, n:'C4 (T5)', t:156e9, k:'rule', size:'806 GB，1560 亿 token（起点：一个 1.4T token 的 CC 快照）', src:'Common Crawl 2019 年 4 月快照', filt:'行以标点结尾且 ≥ 5 词；页面 ≥ 3 句；去脏词；含 “{”、lorem ipsum、terms of use 的去掉；langdetect 英文概率 0.99', dedup:'3 句窗口精确去重', idea:'“Common Crawl 大部分不是有用的自然语言”——用手写规则也能拿到大而干净的子集。'},

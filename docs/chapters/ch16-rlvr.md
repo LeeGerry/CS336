@@ -162,7 +162,7 @@ def grpo_advantages(rewards, group_size, eps=1e-4):
     # rewards: [N*G]，按题目分组连续排列
     r = rewards.view(-1, group_size)            # [N, G]
     mean = r.mean(dim=1, keepdim=True)
-    std = r.std(dim=1, keepdim=True)
+    std = r.std(dim=1, keepdim=True, unbiased=False)  # 总体标准差，与上表一致；torch 默认是样本标准差（除以 G−1）
     adv = (r - mean) / (std + eps)               # eps 防止全对/全错时除以 0
     return adv.view(-1)                          # [N*G]
 

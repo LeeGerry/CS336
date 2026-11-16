@@ -265,7 +265,7 @@ flowchart TB
 
 ### 两个新进展
 
-- **GB200/GB300 NVL72**：每个托盘（tray）8 张 GPU，9 个托盘装一个机架，于是 **72 张 GPU 处于同一个 NVLink 域**（[▶ 27:33](https://www.youtube.com/watch?v=SzpOcwdIL0Y&t=1653s)）。普通人只有“8 卡高速，再往外就慢”，有钱可以把高速域扩到 72 卡。
+- **GB200/GB300 NVL72**：一个机架里的 **72 张 GPU 处于同一个 NVLink 域**（[▶ 27:33](https://www.youtube.com/watch?v=SzpOcwdIL0Y&t=1653s)）。（讲义说成“每托盘 8 张 GPU × 9 个托盘”；按 NVIDIA 官方规格，实际是 18 个计算托盘、每个托盘 2 颗 Grace CPU + 4 张 GPU，另有 9 个 NVSwitch 托盘。）普通人只有“8 卡高速，再往外就慢”，有钱可以把高速域扩到 72 卡。
 - **RoCE（RDMA over Converged Ethernet）**：让以太网也能绕过 CPU 做 RDMA，比 InfiniBand 便宜但稍弱。Meta 有论文在探索，课上说 Llama 可能（也可能没有）是在这种网络上训练的。
 
 ### NCCL：把集合通信翻译成数据包
@@ -389,7 +389,7 @@ duration = time.time() - start
 光看“1.6 毫秒”看不出好坏。类比 MFU（模型 FLOPs 利用率），我们算一个**有效带宽**（[▶ 48:16](https://www.youtube.com/watch?v=SzpOcwdIL0Y&t=2896s)）：
 
 $$
-\text{带宽} = \frac{\text{size\_bytes}\times 2\times (N-1)}{N\times \text{duration}}
+\text{带宽} = \frac{\mathrm{size\_bytes}\times 2\times (N-1)}{N\times \text{duration}}
 $$
 
 - size\_bytes：张量的字节数；

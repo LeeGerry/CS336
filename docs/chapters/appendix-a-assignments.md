@@ -34,7 +34,7 @@
 | A2 systems | 单卡优化 + 多卡并行 | 基准测试脚本、混合精度、显存分析、激活检查点、FlashAttention-2（PyTorch 版 + Triton 版）、DDP（朴素/扁平/重叠）、优化器状态分片、FSDP | [第 5 章](./ch05-gpus-tpus)、[第 6 章](./ch06-kernels-triton)、[第 7 章](./ch07-parallelism-1)、[第 8 章](./ch08-parallelism-2) | ⚠️ 大部分（Triton 测试需 CUDA） |
 | A3 scaling | 缩放定律 | IsoFLOPs 拟合脚本；用训练 API 规划实验、拟合 scaling law、预测最优模型与 loss | [第 9 章](./ch09-scaling-laws-1)、[第 11 章](./ch11-scaling-laws-2) | ⚠️ 只有 IsoFLOPs 题（API 仅限斯坦福） |
 | A4 data | 过滤 Common Crawl | HTML→文本、语言识别、PII 脱敏、有害内容分类、Gopher 规则、质量分类器、精确行去重、MinHash+LSH 去重、过滤流水线 | [第 13 章](./ch13-data-sources)、[第 14 章](./ch14-data-processing) | ✅ 全部单测 |
-| A5 alignment | 推理 RL | 提示词基线、GRPO 各组件（分词、log-prob、奖励、组归一化、策略梯度损失、聚合、训练步）、Dr. GRPO / MaxRL / 离策略变体 | [第 12 章](./ch12-evaluation)、[第 15 章](./ch15-mid-post-training)、[第 16 章](./ch16-rlvr)、[第 17 章](./ch17-alignment-multimodality) | ✅ 必做单测（用 tiny-gpt2 夹具） |
+| A5 alignment | 推理 RL | 提示词基线、GRPO 各组件（分词、log-prob、奖励、组归一化、策略梯度损失、聚合、训练步）、Dr. GRPO / MaxRL / 离策略变体 | [第 12 章](./ch12-evaluation)、[第 15 章](./ch15-mid-post-training)、[第 16 章](./ch16-rlvr) | ✅ 必做单测（用 tiny-gpt2 夹具） |
 
 下面这个小工具把每个作业的题目按“在哪能做”分了类，选你的硬件条件，就能看到哪些题本地可做、哪些要租 GPU、哪些是纸笔题。
 
@@ -383,7 +383,7 @@ def main():
 | 变体 | Dr. GRPO、RFT、MaxRL 的思考、推导与实现（每题 0.5~6 分） | 长度归一化、拒绝采样微调、难度重加权 | 实现：Mac；实验：GPU | 第 16 章 |
 | 离策略 | derive_surrogate_objectives、compute_policy_gradient_loss_off_policy、GSPO 等 | 重要性重加权与裁剪（PPO/GRPO 式、GSPO 式） | 推导：纸笔；实现：Mac；实验：GPU | 第 16 章 |
 | 开放 | try_your_own（10） | 设计你自己的策略梯度估计量 | GPU | 第 16 章 |
-| 选做补充 | SFT、DPO、安全对齐（单独的 supplement PDF） | 指令微调、偏好优化 | — | 第 15、[17 章](./ch17-alignment-multimodality) |
+| 选做补充 | SFT、DPO、安全对齐（单独的 supplement PDF） | 指令微调、偏好优化 | — | 第 15、[16 章](./ch16-rlvr) |
 
 **必做测试**是 `tests/test_grpo.py`（`uv run pytest tests/test_grpo.py`），它用仓库里的 `tiny-gpt2` 小模型夹具，**在 Mac 的 CPU 上就能跑**。选做补充部分的测试（SFT 数据打包、MMLU/GSM8K 解析、DPO 损失）在其他测试文件里。
 
@@ -426,7 +426,7 @@ flowchart LR
   A1["A1 basics<br/>第 0~3 章"] --> A2["A2 systems<br/>第 5~8 章"]
   A2 --> A3["A3 scaling<br/>第 9、11 章"]
   A3 --> A4["A4 data<br/>第 13、14 章"]
-  A4 --> A5["A5 alignment<br/>第 15~17 章"]
+  A4 --> A5["A5 alignment<br/>第 15、16 章"]
 ```
 
 ### 给 Mac 用户的“先本地、后上云”顺序

@@ -582,7 +582,7 @@ p = {"Wikipedia": 0.3, "CC": 0.5, "GitHub": 0.2}   # 一种可能的配比
 
 - **凭感觉（vibes）**：按直觉手动设定——比你想象的更常见，即使是最近的论文也常常是“用某种方法算一下，再手动调一调”；
 - **均匀采样**：$p(s) \propto 1$；
-- **按大小比例**：$p(s) \propto \text{num\_tokens}(s)$——合理，但一个巨大的低质量来源会吃掉大部分份额。
+- **按大小比例**：$p(s) \propto \mathrm{num\_tokens}(s)$——合理，但一个巨大的低质量来源会吃掉大部分份额。
 
 直觉上应该**给高质量来源更高权重**。但有两点要注意：
 
@@ -608,11 +608,11 @@ p = {"Wikipedia": 0.3, "CC": 0.5, "GitHub": 0.2}   # 一种可能的配比
 
 这个问题很早就被注意到了，尤其在多语言模型里——有些语言的数据极少。
 
-- 之前的做法：在“均匀”和“按比例”之间插值，$p(s) \propto \text{num\_tokens}(s)^{\alpha}$，$\alpha \in [0, 1]$，把分布压平一点；
+- 之前的做法：在“均匀”和“按比例”之间插值，$p(s) \propto \mathrm{num\_tokens}(s)^{\alpha}$，$\alpha \in [0, 1]$，把分布压平一点；
 - **UniMax** 的想法更直接：**尽量均匀地采样各来源，但对任何来源的 epoch 数设一个硬上限 $C$**。某个来源达到上限就不再给它更多 token，剩余预算分给别的来源。约束写成：
 
 $$
-\frac{p(s) \cdot T}{\text{num\_tokens}(s)} \le C \quad \text{对所有来源 } s
+\frac{p(s) \cdot T}{\mathrm{num\_tokens}(s)} \le C \quad \text{对所有来源 } s
 $$
 
 - $T$：总训练 token 数；

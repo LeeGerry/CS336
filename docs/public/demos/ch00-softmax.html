@@ -40,7 +40,7 @@ tr.target td:first-child{font-weight:700;color:var(--good)}
 </head>
 <body>
 <h3>Softmax、温度、交叉熵与困惑度</h3>
-<div class="muted">句子“我家养了一只 ___”的下一个词候选。拖动每个词的 logit（模型原始打分），再调温度 T。点一行把它设为“正确答案”。</div>
+<div class="muted">句子“我爱吃 ___”的下一个词候选（与正文 0.6 节同一个例子）。拖动每个词的 logit（模型原始打分），再调温度 T。点一行把它设为“正确答案”。</div>
 
 <div class="row">
   <label>温度 T = <span id="tv" class="mono"></span></label>
@@ -73,8 +73,8 @@ tr.target td:first-child{font-weight:700;color:var(--good)}
 
 <script>
 (function(){
-  var words=['猫','狗','鱼','仓鼠','汽车'];
-  var logits=[2.0,1.5,0.3,-0.5,-3.0];
+  var words=['苹果','火锅','饭','键盘','。'];
+  var logits=[3.0,2.5,2.0,-1.0,0.5];
   var target=0, samples=[];
   var $=function(id){return document.getElementById(id);};
   function T(){return Math.exp(+$('temp').value);}

@@ -21,11 +21,11 @@ features:
     link: /chapters/ch01-overview-tokenization
   - icon: ⚡
     title: 第二部分 · 系统
-    details: GPU/TPU 原理、Kernel 与 Triton、数据/张量/流水线并行、推理与 KV Cache。学会让硬件跑满。
+    details: GPU/TPU 原理、Kernel 与 Triton、数据/张量/流水线并行。学会让硬件跑满。
     link: /chapters/ch05-gpus-tpus
   - icon: 📈
-    title: 第三部分 · 缩放定律
-    details: 用小实验预测大模型：Chinchilla、IsoFLOP、超参数迁移。花一千万美元之前先算清楚。
+    title: 第三部分 · 缩放定律与推理
+    details: 用小实验预测大模型：Chinchilla、IsoFLOP、超参数迁移；以及推理与 KV Cache。花一千万美元之前先算清楚。
     link: /chapters/ch09-scaling-laws-1
   - icon: 🗂️
     title: 第四部分 · 评估与数据
