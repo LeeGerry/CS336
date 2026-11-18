@@ -17,7 +17,7 @@
 1. 今天几乎所有大模型的骨架，仍然是 2017 年那篇 Transformer 论文的结构；真正改动的只是少数几个零件。
 2. 大家一致同意的改动：**把归一化移出残差主干（pre-norm）**、**用 RMSNorm 替代 LayerNorm**、**去掉偏置项**、**用门控激活（SwiGLU/GeGLU）**、**用 RoPE 编码位置**。理由一半是效果，一半是系统效率和训练稳定性。
 3. 很多超参数存在一个“宽阔的盆地”：`d_ff ≈ 4·d_model`（门控版约 8/3 倍）、`头数 × 头维度 = d_model`、`d_model / 层数 ≈ 100`，在附近选都不会差太多。
-4. 训练会“炸”的地方通常是 softmax（有指数、有除法）。z-loss 管输出 softmax，QK-norm 和 soft-capping 管注意力 softmax。
+4. 训练会“炸”的地方通常是 softmax（有指数、有除法）。z-loss 管输出 softmax，QK-norm 管注意力 softmax，soft-capping 两处都能用。
 5. 推理时最贵的往往不是计算而是**搬运 KV cache**，于是有了 MQA/GQA（让多个查询头共享 K、V）和滑动窗口注意力。
 
 ---
@@ -54,7 +54,7 @@
 
 ```mermaid
 flowchart TB
-    A["token ID 序列<br/>例如 [512, 87, 3021]"] --> B["词嵌入 Embedding<br/>查表得到向量"]
+    A["token ID 序列<br/>例如 [421, 87, 3021]"] --> B["词嵌入 Embedding<br/>查表得到向量"]
     B --> C["Transformer Block × L 层<br/>(注意力 + FFN)"]
     C --> D["最终归一化 Norm"]
     D --> E["输出层 Linear<br/>d_model → 词表大小"]
@@ -65,7 +65,7 @@ flowchart TB
 
 ### 3.2.2 第一步：词嵌入（Embedding）——查表
 
-**直觉**：token ID 只是一个编号，比如 512 号代表“猫”。编号本身没有“含义”，512 和 513 也不一定相近。我们需要把每个编号换成一个能被神经网络计算的“特征向量”。
+**直觉**：token ID 只是一个编号，比如 421 号代表“猫”。编号本身没有“含义”，421 和 422 也不一定相近。我们需要把每个编号换成一个能被神经网络计算的“特征向量”。
 
 **定义**：准备一个形状为 `(V, d_model)` 的大矩阵，第 i 行就是 i 号 token 的向量。输入 ID 序列，按行查表即可。这个矩阵的数值是训练学出来的。
 
@@ -75,7 +75,7 @@ import torch.nn as nn
 
 V, d_model = 10000, 512
 emb = nn.Embedding(V, d_model)          # 一个 (V, d_model) 的可学习矩阵
-ids = torch.tensor([[512, 87, 3021]])   # 形状 (B=1, T=3)
+ids = torch.tensor([[421, 87, 3021]])   # 形状 (B=1, T=3)
 x = emb(ids)                            # 按行查表 → 形状 (1, 3, 512)
 ```
 
@@ -195,7 +195,7 @@ $$\text{FFN}(x) = \sigma(xW_1)\,W_2$$
 
 ### 3.2.7 归一化：给每个向量“调音量”
 
-深层网络里，数值很容易越传越大或越传越小。**归一化**就是在进入每个子层之前，把每个位置的向量“标准化”一下。原始 Transformer 用的是 LayerNorm：
+深层网络里，数值很容易越传越大或越传越小。**归一化**就是把每个位置的向量“标准化”一下。它具体放在子层之前还是之后，3.3 节会专门讲（原始 Transformer 放在子层之后，现代模型放在之前）。原始 Transformer 用的归一化是 LayerNorm：
 
 $$\text{LayerNorm}(x) = \frac{x-\mu}{\sqrt{\sigma^2+\varepsilon}}\odot\gamma+\beta$$
 
@@ -260,7 +260,7 @@ $$12 \times 12288^2 \times 96 \approx 12 \times 1.51\times10^8 \times 96 \approx
 
 ## 3.3 归一化放在哪：pre-norm vs post-norm
 
-### 3.3.1 唯一的共识
+### 3.3.1 难得的共识
 
 Tatsu 说，大家对架构可以吵很多事，但有一件事几乎所有人都同意：**原始 Transformer 把 LayerNorm 放错了地方。**[▶ 07:10](https://www.youtube.com/watch?v=lVynu4bo1rY&t=430s)
 
@@ -457,7 +457,7 @@ $$\langle f(x, i),\, f(y, j)\rangle = g(x, y, i-j)$$
 我们知道一个几何事实：**两个向量同时旋转同一个角度，它们的点积不变**（夹角没变）。于是：
 
 1. 先拿到与位置无关的“语义向量”；
-2. 位置为 m 的词，就把它的向量**旋转 m·θ 度**。
+2. 位置为 m 的词，就把它的向量**旋转 m 份角度**，也就是转过 m·θ（θ 是固定的“一份角度”，按弧度计）。
 
 课上的例子 [▶ 34:31](https://www.youtube.com/watch?v=lVynu4bo1rY&t=2071s)：
 
@@ -524,7 +524,7 @@ def rope(x, pos, theta=10000.0):
 
 ### 3.8.1 FFN 宽度：d_ff = 4 × d_model
 
-这是一个几乎被所有模型遵守的经验值。例外有两类：
+这是最经典的经验值，用普通激活函数（ReLU、GELU）的 FFN 几乎都遵守。例外有两类：
 
 **例外一：门控 FFN**。如 3.5.3 节所述，按 2/3 缩小后约为 2.67 倍。课上的数据：
 
@@ -576,7 +576,7 @@ LLaMA 2 和 Mistral 的 3.5 稍大一点。课上的解读是：LLaMA 2 用了�
 | Gemma 4 | 61 |
 | T5（11B） | 33 |
 
-手算 GPT-3：`12288 / 96 = 128`。大多数模型落在 100 到 200 之间。
+手算 GPT-3：`12288 / 96 = 128`。大多数模型落在 100 到 200 之间；Gemma 3、Gemma 4 和 T5（11B）是明显偏深的例外。
 
 为什么不更深？很大程度上是**系统原因**：非常深的模型延迟更高，也更难并行。把模型按层切到不同 GPU 上叫**流水线并行**，课上说“大多数人真的不想碰它”；而把很宽的矩阵切开（**张量并行**）要简单得多。这些会在 [第 7 章](./ch07-parallelism-1) 详细讲。所以系统上倾向于宽，表达能力上也许倾向于深，最后落在 100 左右。
 
@@ -587,7 +587,7 @@ LLaMA 2 和 Mistral 的 3.5 稍大一点。课上的解读是：LLaMA 2 用了�
 两大阵营：[▶ 54:40](https://www.youtube.com/watch?v=lVynu4bo1rY&t=3280s)
 
 - **单语（英语为主）模型**：3 万到 5 万。原始 Transformer 37000，GPT 40257，GPT-2/3 50257，T5 32128，LLaMA 32000。
-- **多语言 / 生产级模型**：10 万到 25 万。mT5 250000，PaLM 256000，GPT-4 100276，Gemma 4 262144，DeepSeek 100000，Qwen 15B 152064，Yi 64000。
+- **多语言 / 生产级模型**：大多在 10 万到 26 万之间（Yi 的 64000 是偏小的例外）。mT5 250000，PaLM 256000，GPT-4 100276，Gemma 4 262144，DeepSeek 100000，Qwen 14B 152064，Yi 64000。
 
 多语言模型需要覆盖更多文字，自然需要更大的词表。另外，越大的模型能“消化”越大的词表（有缩放律研究支持），而现在基本没人训练大型单语模型了。
 
@@ -688,13 +688,13 @@ $$\text{logits} \leftarrow c \cdot \tanh\!\left(\frac{\text{logits}}{c}\right)$$
 
 > 大白话：tanh 的输出被夹在 −1 到 1 之间，所以变换后的 logits 永远在 −c 到 c 之间。logits 较小时几乎不变，较大时被“软软地”压住。c 是封顶值。
 
-这主要是 Google 的做法，Gemma 2、3、4 都用了。但代价是：模型永远无法在 softmax 里表达“非常确定”的信号。NVIDIA 的研究者做过系统对比：QK-norm 由于允许使用更大的学习率，效果略好于基线；而**单独**使用 soft-capping 反而会损失效果。所以它是一个“很安全但有副作用”的选项。
+这主要是 Google 的做法，Gemma 2、3、4 都用了。它既可以加在注意力的 logits 上，也可以加在最终输出的 logits 上（Gemma 2 两处都加了）。但代价是：模型永远无法在 softmax 里表达“非常确定”的信号。NVIDIA 的研究者做过系统对比：QK-norm 由于允许使用更大的学习率，效果略好于基线；而**单独**使用 soft-capping 反而会损失效果。所以它是一个“很安全但有副作用”的选项。
 
 | 技巧 | 作用位置 | 思路 | 代表 |
 |---|---|---|---|
 | z-loss | 输出 softmax | 损失里惩罚 log Z 偏离 0 | PaLM、Baichuan 2、DCLM、OLMo 2/3 |
 | QK-norm | 注意力 softmax 的输入 | 对 q、k 先归一化 | DCLM、OLMo 2、Gemma 2、Qwen3、Gemma 4 |
-| soft-capping | 注意力 logits | 用 tanh 硬性封顶 | Gemma 2/3/4 |
+| soft-capping | 注意力 logits、输出 logits | 用 tanh 硬性封顶 | Gemma 2/3/4 |
 
 ---
 
@@ -755,7 +755,7 @@ flowchart LR
     end
 ```
 
-“KV 头数”成了一个简单的旋钮，可以在表达能力和推理效率之间连续调节。Ainslie 等人（2023）的实验显示：MHA 效果最好但最慢；MQA 最快但效果明显下降；GQA 几乎拿到了 MHA 的效果，同时推理速度接近 MQA——只需少量减少 KV 头，就能拿到大部分收益。这就是如今几乎所有模型都用 GQA 的原因。[▶ 81:02](https://www.youtube.com/watch?v=lVynu4bo1rY&t=4862s)
+“KV 头数”成了一个简单的旋钮，可以在表达能力和推理效率之间连续调节。Ainslie 等人（2023）的实验显示：MHA 效果最好但最慢；MQA 最快但效果明显下降；GQA 几乎拿到了 MHA 的效果，同时推理速度接近 MQA——KV 头不必减到只剩 1 份，保留少数几组（比如 8 组）就能兼顾效果和速度。这就是如今几乎所有模型都用 GQA 的原因。[▶ 81:02](https://www.youtube.com/watch?v=lVynu4bo1rY&t=4862s)
 
 **手算 KV cache**：以 LLaMA 2 70B 的形状为例（80 层、64 个查询头、8 个 KV 头、头维度 128，bf16 每个数 2 字节）：
 
