@@ -147,7 +147,7 @@ B00 B01 B02 B03 ... B30 B31     ← 第 1 行：又从 B00 开始
 
 ### 6.2.4 内存合并访问：HBM 按缓存行取数
 
-这一条第 5 章讲过，Percy 快速重温：一个 warp 的 32 个线程访问 HBM 时，访问会被**合并成 128 字节的事务**（叫缓存行，cache line），一次取回来。[▶ 17:18](https://www.youtube.com/watch?v=xnDHaNUvHBg&t=1038s)
+这一条第 5 章讲过，Percy 快速重温：一个 warp 的 32 个线程访问 HBM 时，访问会被**合并成 128 字节的事务**（Percy 叫它缓存行，cache line；就是第 5 章 Tatsu 说的“突发段”，两位老师叫法不同），一次取回来。[▶ 17:18](https://www.youtube.com/watch?v=xnDHaNUvHBg&t=1038s)
 
 ```
 M00 M01 M02 ... M31    ← 一条 128 字节的缓存行（32 个 4 字节 float）
@@ -273,7 +273,7 @@ def profile(run, num_warmups=1):
 | `f32` | FP32 数据类型 |
 | `64x64x16` | 分块形状（后面讲矩阵乘法时会看到） |
 
-（讲义原文中这个名字还包含 `simt`、`sgemm` 等片段，讲义没有逐一解释，这里也不展开。）
+（讲义没有解释名字里的其他片段。`sgemm` 是线性代数库里的标准叫法：s 表示单精度，gemm 表示通用矩阵乘法（general matrix multiply）。`simt` 讲义未作说明，这里不展开。）
 
 作业里你会用 NVIDIA Nsight 得到更详细的信息，本讲为节省时间跳过了。[▶ 29:31](https://www.youtube.com/watch?v=xnDHaNUvHBg&t=1771s)
 
@@ -310,7 +310,7 @@ compiled_gelu = torch.compile(naive_gelu)
 
 `torch.compile` 是个值得知道的工具：传入任何 PyTorch 函数，它返回一个做同样事情（语义不变）的新函数。[▶ 31:32](https://www.youtube.com/watch?v=xnDHaNUvHBg&t=1892s)
 
-在 16384 × 16384 的输入上测速：朴素版最慢（课上读出的数字是 3.75），内置版快得多，编译版也快得多，但略慢于内置版。三者算的是同一个东西，性能却差很多。为什么？
+在 16384 × 16384 的输入上测速：朴素版最慢（课上读出的数字是 3.75；Percy 没念单位，按 `benchmark` 函数的返回值应是毫秒），内置版快得多，编译版也快得多，但略慢于内置版。三者算的是同一个东西，性能却差很多。为什么？
 
 ### 6.4.2 剖析器揭晓答案
 
@@ -402,6 +402,10 @@ def triton_gelu_kernel(x_ptr, y_ptr, num_elements, BLOCK_SIZE: tl.constexpr):
 
 几乎所有 kernel 都是这个样子：**输入、输出 → 醒来确认自己负责哪部分 → 读 → 算 → 写回 HBM。**
 
+::: warning 手写 tanh 的一个坑
+讲义这种 `(exp(2a) - 1) / (exp(2a) + 1)` 的写法只适合演示：FP32 下 $x$ 大于约 10 时，`exp(2a)` 会溢出成无穷大，结果变成 NaN。自己写 kernel（比如练习 4）时，可以改用等价的 `1 - 2 / (exp(2a) + 1)`，溢出时它会正确地得到 1。
+:::
+
 用 Kotlin 伪代码理解“每个块做什么”：
 
 ```kotlin
@@ -457,9 +461,10 @@ def naive_softmax(x):
     x = x - x_max[:, None]           # 读 MN + M，写 MN
     numerator = torch.exp(x)         # 读 MN，写 MN
     denominator = numerator.sum(dim=1)   # 读 MN，写 M
-    y = numerator / denominator[:, None] # 读 MN，写 MN
+    y = numerator / denominator[:, None] # 读 MN + M，写 MN
     return y
-    # 合计：约 5MN + M 次读，3MN + 2M 次写
+    # 合计：约 5MN + 2M 次读，3MN + 2M 次写
+    # （讲义把最后一步记成“读 MN”、合计 5MN + M，漏了读分母的 M 次；差别可忽略）
     # 理想情况：只需 MN 次读、MN 次写 —— 差了约 4 倍
 ```
 
@@ -556,7 +561,7 @@ Percy 特意澄清：在 GeLU 里我们也把数据切成了很多段，但那�
 
 固定一个输出位置 $(m, n)$，对每个 $k$：从 HBM 读 $A[m,k]$ 和 $B[k,n]$，相乘累加；最后把结果写回 $C[m,n]$。[▶ 73:14](https://www.youtube.com/watch?v=xnDHaNUvHBg&t=4394s)
 
-这是正确的 kernel，但读写量很糟：总共要读约 $MKN$ 次。运算量也是 $MKN$ 量级，所以
+这是正确的 kernel，但读写量很糟：总共要读约 $MKN$ 次（严格说 $A$、$B$ 各读一次，是 $2MKN$，量级一样）。运算量也是 $MKN$ 量级，所以
 
 $$
 \text{算术强度} = \frac{O(MKN)}{O(MKN)} = O(1)
@@ -645,7 +650,7 @@ def matmul_relu_kernel(a_ptr, b_ptr, c_ptr, M, N, K,
 
 ## 6.9 关于标题里的 XLA
 
-本讲的标题是“Kernels, Triton, XLA”，但从字幕和讲义看，课上**没有专门讲 XLA**。这里补充一句背景，方便你理解第 5 章提到的“JAX 的编译器”：XLA 是 Google 的机器学习编译器，JAX（以及 TensorFlow）通过它把计算图编译到 GPU/TPU 上，它和 `torch.compile` 一样会自动做算子融合之类的优化。区别在于 JAX 程序默认就要经过编译，而 PyTorch 默认是逐个运算立即执行（eager），需要你主动调用 `torch.compile`。课程的作业以 PyTorch + Triton 为主。
+本讲的标题是“Kernels, Triton, XLA”，但从字幕和讲义看，课上**没有专门讲 XLA**。这里补充一句背景，方便你理解第 5 章提到的“JAX 的编译器”：XLA 是 Google 的机器学习编译器，JAX（以及 TensorFlow）通过它把计算图编译到 GPU/TPU 上，它和 `torch.compile` 一样会自动做算子融合之类的优化。两边的用法也很像：不加任何修饰时，JAX 和 PyTorch 都是逐个运算立即执行（eager）的；要让整段函数被编译、融合，JAX 需要你套上 `jax.jit`，PyTorch 需要你调用 `torch.compile`。只是 JAX 社区习惯上几乎处处都用 `jit`。课程的作业以 PyTorch + Triton 为主。
 
 ---
 
