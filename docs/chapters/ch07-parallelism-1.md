@@ -216,7 +216,7 @@ $$
 
 ### 家用级：PCIe + 以太网
 
-先看一张“老派”的电脑结构（[▶ 21:27](https://www.youtube.com/watch?v=SzpOcwdIL0Y&t=1287s)）：主板上有 CPU 和内存，有一条 PCIe 总线（以前插鼠标键盘、声卡的那种），GPU 挂在 PCIe 上；电脑之间用以太网连。
+先看一张“老派”的电脑结构（[▶ 21:27](https://www.youtube.com/watch?v=SzpOcwdIL0Y&t=1287s)）：主板上有 CPU 和内存，有一条 PCIe 总线（插显卡、声卡、网卡这类扩展卡的那种），GPU 挂在 PCIe 上；电脑之间用以太网连。
 
 - 同一台机器上的 GPU 通过 **PCIe** 通信。讲义给的数字是 PCIe 7.0、16 通道约 242 GB/s。
 - 不同机器上的 GPU 通过**以太网**通信，讲义给的量级是约 200 MB/s。
@@ -316,7 +316,9 @@ def setup(rank, world_size):
 
 def worker(rank, world_size):
     setup(rank, world_size)
-    data = torch.tensor([0., 1, 2, 3]) + rank      # 每个 rank 的数据不同
+    # nccl 后端只接受 GPU 上的张量，所以张量要建在本 rank 对应的那张卡上
+    device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
+    data = torch.tensor([0., 1, 2, 3], device=device) + rank   # 每个 rank 的数据不同
     dist.barrier()                                  # 等所有进程都走到这里
     dist.all_reduce(data, op=dist.ReduceOp.SUM)     # 原地修改 data
     print(f"rank {rank}: {data}")                   # 每个 rank 都打印 [6,10,14,18]
@@ -341,27 +343,27 @@ if __name__ == "__main__":
 和 `all_reduce` 原地修改不同，这两个操作有**单独的输入和输出张量**，输出要你先分配好：
 
 ```python
-# reduce-scatter：输入长度 world_size，输出长度 1
-inp = torch.arange(world_size, dtype=torch.float32) + rank
-out = torch.empty(1)
+# reduce-scatter：输入长度 world_size，输出长度 1（device 的取法同上一段代码）
+inp = torch.arange(world_size, dtype=torch.float32, device=device) + rank
+out = torch.empty(1, device=device)
 dist.reduce_scatter_tensor(output=out, input=inp, op=dist.ReduceOp.SUM)
 # rank 0 得到 6，rank 1 得到 10，rank 2 得到 14，rank 3 得到 18
 
 # all-gather：把上一步的结果再收集回来
-full = torch.empty(world_size)
+full = torch.empty(world_size, device=device)
 dist.all_gather_into_tensor(output_tensor=full, input_tensor=out)
 # 每个 rank 都得到 [6, 10, 14, 18]，和 all_reduce 的结果完全一样
 ```
 
 课上管这叫“举例证明”：all-reduce 确实等于 reduce-scatter + all-gather（[▶ 45:11](https://www.youtube.com/watch?v=SzpOcwdIL0Y&t=2711s)）。
 
-（注：按 PyTorch 文档的后端支持表，CPU 上的 gloo 后端并不支持所有集合操作，例如 reduce-scatter 支持有限；需要时请在 GPU 上用 nccl 后端运行。）
+（注：CPU 上的 gloo 后端并不支持所有集合操作。按 PyTorch 文档的后端支持表，gloo 不支持 reduce-scatter；`all_gather_into_tensor` 在一些版本的 gloo 上也会报错，PyTorch 自己的代码在 CPU 上是改用列表版的 `dist.all_gather` 绕过去的。所以这一小段请在 GPU 上用 nccl 后端运行。）
 
 ### 同步与异步
 
 上面的调用都是 `async_op=False`（默认，同步）。如果设成 `True`，调用会立刻返回一个句柄，NCCL 在后台通信，你可以先去做别的事（比如加载下一批数据），需要结果时再 `wait()`（[▶ 44:10](https://www.youtube.com/watch?v=SzpOcwdIL0Y&t=2650s)）。这就是**通信与计算重叠**的基础，本章的简化实现没有做，但它在实际系统里非常重要，作业 2 会让你实践。
 
-注意这里有**两层异步**：CUDA kernel 相对于 Python 进程本来就是异步的（见[第 5 章](./ch05-gpus-tpus)），现在多个进程之间也是异步的。
+注意这里有**两层异步**：CUDA kernel 相对于 Python 进程本来就是异步的（见[第 2 章](./ch02-pytorch-resource)和[第 6 章](./ch06-kernels-triton)的基准测试部分），现在多个进程之间也是异步的。
 
 ---
 
@@ -382,7 +384,7 @@ torch.cuda.synchronize(); dist.barrier()  # 同上，确保真的做完了
 duration = time.time() - start
 ```
 
-为什么既要 `synchronize` 又要 `barrier`？`synchronize` 确保**本卡**的 CUDA kernel 跑完；`barrier` 确保**所有进程**都到了这一步。顺序也有讲究：如果先 barrier 再 synchronize，kernel 可能还没跑完，barrier 就已经“空过”了，各进程其实没有真正对齐（[▶ 54:25](https://www.youtube.com/watch?v=SzpOcwdIL0Y&t=3265s)）。
+为什么既要 `synchronize` 又要 `barrier`？`synchronize` 确保**本卡**的 CUDA kernel 跑完；`barrier` 确保**所有进程**都到了这一步。顺序上，有同学问能不能先 barrier 再 synchronize，老师说不太确定，但给了一个推测：如果先 barrier 再 synchronize，kernel 可能还没跑完，barrier 就已经“空过”了，各进程其实没有真正对齐（[▶ 54:25](https://www.youtube.com/watch?v=SzpOcwdIL0Y&t=3265s)）。
 
 ### 有效带宽怎么算
 
@@ -403,14 +405,16 @@ $$
 \frac{4.19\times10^8\times2\times3}{4\times1.6\times10^{-3}} = \frac{2.52\times10^9}{6.4\times10^{-3}}\approx 3.9\times10^{11}\ \text{B/s}
 $$
 
-约 390 GB/s（讲义按 $1024^3$ 换算报告为 366 GB/s），其他 rank 在 390~426 GB/s，所以课上说“大约 400 GB/s”。
+讲义的程序把这个数除以 $1024^3$ 再报告，rank 0 得到 366 GB/s；同样的口径下，另外三个 rank 分别是 390、426、425 GB/s，所以课上说“大约 400 GB/s”。
 
 公式化简一下：当 $N$ 变大，$\frac{N-1}{N}\to1$，带宽 ≈ $\frac{2\times\text{size}}{\text{duration}}$。这说明两点：
 
 1. **有效带宽与卡数无关**：卡数增加，带宽并不会变差，这是好消息。
 2. **与拓扑无关**：用环形还是树形，由 NCCL 决定，公式不变。
 
-reduce-scatter 的算法类似，只是**没有那个 2**，因为它只做了“一半”的事。课上测出来两者带宽都在 400 多 GB/s：all-reduce 搬了两倍的数据，也花了约两倍的时间，比值相近。
+reduce-scatter 的算法类似，只是**没有那个 2**，因为它只做了“一半”的事。讲义测出来 reduce-scatter 的带宽是 450~490 GB/s，和 all-reduce 的 366~426 GB/s 在同一个量级。课上的解释是：同样大小的数据，all-reduce 要搬两倍的量，也要花约两倍的时间，两者相除，带宽相近。
+
+注意不要直接比较讲义输出里的两个耗时（all-reduce 约 1.4~1.6 ms，reduce-scatter 约 2.4~2.6 ms）：reduce-scatter 那次测试里，每个 rank 的输入是 world\_size × num\_elements 的矩阵，是 all-reduce 那次的 4 倍大，所以它反而更慢。
 
 下面这个计算器把同样的公式用在“数据并行同步梯度”上。试着把连接从 NVLink 换成 InfiniBand、以太网，体会一下为什么不同的并行方式要放在不同的链路上。
 
@@ -516,7 +520,7 @@ def tensor_parallel_forward(rank, world_size, data, params):
     for W in params:
         x = F.gelu(x @ W)    # 只算出 batch × local_dim 这一片；GeLU 是逐元素的，可以直接做
         # 分配接收缓冲区：world_size 个 batch × local_dim
-        parts = [torch.empty(batch_size, local_dim) for _ in range(world_size)]
+        parts = [torch.empty(batch_size, local_dim, device=x.device) for _ in range(world_size)]
         dist.all_gather(parts, x)          # 每个 rank 把自己那一片发给所有人
         x = torch.cat(parts, dim=1)        # 拼回 batch × num_dim，作为下一层输入
     return x
@@ -565,7 +569,8 @@ def pipeline_forward(rank, world_size, data, local_params, num_micro_batches):
     if rank == 0:
         micro_batches = data.chunk(num_micro_batches, dim=0)  # 第一段：手里有数据
     else:
-        micro_batches = [torch.empty(micro_bs, data.size(1)) for _ in range(num_micro_batches)]
+        micro_batches = [torch.empty(micro_bs, data.size(1), device=data.device)
+                         for _ in range(num_micro_batches)]
     for x in micro_batches:
         if rank > 0:
             dist.recv(tensor=x, src=rank - 1)    # 从上一段接收激活
@@ -631,7 +636,7 @@ def pipeline_forward(rank, world_size, data, local_params, num_micro_batches):
    逐位置求和：第 0 位 1+3+0+2 = 6，第 1 位 0+1+0+2 = 3，第 2 位 2+0+5+2 = 9，第 3 位 1+0+2+2 = 5。reduce-scatter 后 rank 0~3 分别得到 [6]、[3]、[9]、[5]；all-gather 后每张卡都是 [6,3,9,5]，与 all-reduce 结果相同。
    :::
 
-2. **跑通集合通信**：用 `mp.spawn` 起 4 个进程，复现本章 7.4 节的 all-reduce，并打印每个 rank 的结果（没有多张 GPU 时可用 CPU 上的 `gloo` 后端）。然后把 `all_reduce` 换成“先 `reduce_scatter_tensor` 再 `all_gather_into_tensor`”的两步（若所用后端不支持 reduce-scatter，可以用“`reduce` 到各自目标 rank”的循环来模拟），确认结果一致。
+2. **跑通集合通信**：用 `mp.spawn` 起 4 个进程，复现本章 7.4 节的 all-reduce，并打印每个 rank 的结果（没有多张 GPU 时可用 CPU 上的 `gloo` 后端）。然后把 `all_reduce` 换成“先 `reduce_scatter_tensor` 再 `all_gather_into_tensor`”的两步，确认结果一致。如果你用的是 gloo，这两个函数可能都不支持：reduce-scatter 可以用“`reduce` 到各自目标 rank”的循环来模拟，all-gather 可以换成列表版的 `dist.all_gather`（7.7 节的代码用的就是它）。
 
 3. **通信量估算**：一个 7B 参数模型，用 bf16 梯度做 64 路数据并行，每卡每步要发送多少字节？若走 InfiniBand（按 50 GB/s 估），一次 all-reduce 约多久？
 
