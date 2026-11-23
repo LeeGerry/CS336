@@ -154,7 +154,7 @@ flowchart LR
 | 输入 | [0,1,2,3] | [1,2,3,4] | [2,3,4,5] | [3,4,5,6] |
 | 输出 | [6,10,14,18] | [6,10,14,18] | [6,10,14,18] | [6,10,14,18] |
 
-从效果上看它最好理解：大家把张量逐元素加起来，每个人都拿到同一份结果。数据并行（DDP）同步梯度用的就是它。
+从效果上看它最好理解：大家把张量逐元素加起来，每个人都拿到同一份结果。数据并行（DDP）同步梯度用的就是它。这里的“加”只是最常见的一种归约运算，换成求平均、取最大值也都叫 all-reduce；7.6 节同步梯度时用的就是求平均（`ReduceOp.AVG`），相当于求和之后再除以卡数。
 
 $$
 \text{all-reduce} = \text{reduce-scatter} + \text{all-gather}
@@ -223,13 +223,15 @@ $$
 
 如果你买了两块游戏显卡、再拉上朋友的电脑想一起训练大模型，你面对的就是这种拓扑。
 
+注意 242 GB/s 是 PCIe 7.0 这个最新规格的理论上限，市面上大多数主板和显卡用的是 PCIe 4.0 或 5.0，x16 只有约 32 GB/s 和 63 GB/s。所以别因为这个数字比下面 InfiniBand 的 50 GB/s 大，就以为家用机比数据中心快。
+
 ### 数据中心级：NVLink、NVSwitch、InfiniBand
 
 认真训练大模型的机房长这样（[▶ 23:27](https://www.youtube.com/watch?v=SzpOcwdIL0Y&t=1407s)）：
 
 - **一台机器（node，节点）通常 8 张 GPU**，通过 NVIDIA 的 **NVLink** 连到一个 **NVSwitch** 上。以 B200 使用的 NVLink 5.0 为例，总带宽约 **1.8 TB/s**。对比一下：B200 的 HBM 显存带宽约 **8 TB/s**，所以 NVLink 大约慢 4 倍多。作为“卡与卡之间”的连接，这已经非常快了。
 - 有了 NVSwitch，从编程角度看，**机器内任意两张卡都能直接互通**：你只管发，交换机负责路由。
-- 机器多了，一个 NVSwitch 就挂不下了。于是把很多台机器组成一个 **pod（机柜组）**，用 **InfiniBand** 连接。路径变成 GPU → PCIe → InfiniBand 网卡（HCA）→ InfiniBand 线缆，讲义给的量级约 **0.05 TB/s（50 GB/s）**，比 NVLink 慢一个数量级以上。（讲义里“每个 pod 256 台机器”这个数字，老师说是随手举的例子。）
+- 机器多了，一个 NVSwitch 就挂不下了。于是把很多台机器组成一个 **pod（机柜组）**，用 **InfiniBand** 连接。路径变成 GPU → PCIe → InfiniBand 网卡（HCA）→ InfiniBand 线缆，讲义给的量级约 **0.05 TB/s（50 GB/s）**，比 NVLink 慢一个数量级以上。这条路径上虽然也经过 PCIe，但瓶颈在 InfiniBand 网卡和线缆上，所以整体只有 50 GB/s 左右。（讲义里“每个 pod 256 台机器”这个数字，老师说是随手举的例子。）
 - pod 再多，就只能用**以太网**把它们连起来，而且要经过 CPU，更慢。
 
 ```mermaid
@@ -284,7 +286,7 @@ flowchart TB
 |---|---|---|---|
 | HBM（卡内） | ~8 TB/s（B200） | — | 单卡内部 |
 | NVLink 5 + NVSwitch | ~1.8 TB/s | 是 | 同一节点（8 卡，NVL72 可到 72 卡） |
-| PCIe 7.0 x16 | ~242 GB/s | — | 家用机多卡 |
+| PCIe 7.0 x16 | ~242 GB/s（规格上限，常见的 4.0/5.0 约 32/63 GB/s） | — | 家用机多卡 |
 | InfiniBand | ~50 GB/s | 是（RDMA） | 节点之间 |
 | 普通以太网 | ~200 MB/s | 否 | 机器/机房之间 |
 
@@ -300,7 +302,7 @@ PyTorch 的 `torch.distributed`（下面简写为 `dist`）给集合通信提供
 
 ### 进程模型：一张卡一个进程
 
-讲义写了一个 `spawn` 辅助函数：启动 world size 个进程，每个进程跑同一个函数，只是传入的 `rank` 不同。这和你在 App 里开 4 个后台线程执行同一段代码、各自处理不同任务很像，只不过这里是**进程**，彼此不共享内存，只能靠通信交换数据。
+讲义写了一个 `spawn` 辅助函数，内部调用的就是 PyTorch 的 `mp.spawn`（下面的代码直接用它）：启动 world size 个进程，每个进程跑同一个函数，只是传入的 `rank` 不同。这和你在 App 里开 4 个后台线程执行同一段代码、各自处理不同任务很像，只不过这里是**进程**，彼此不共享内存，只能靠通信交换数据。
 
 ```python
 import os, torch
@@ -479,7 +481,7 @@ def data_parallel_step(rank, world_size, data, params, optimizer):
 
 每个 rank 处理的只是一部分数据，但更新效果就像它看到了全部数据。这种方式叫 **DDP（Distributed Data Parallel）**。
 
-::: tip 移动端类比
+::: tip 生活类比
 就像 4 个人分头给一个相册的 400 张照片打标签，每人 100 张，各自得出“我觉得这个分类器该怎么调”的意见；每轮结束开个会，把意见取平均，然后大家按同一个结论修改各自手里那份一模一样的分类器。会开得越快（通信越快），整体越高效。
 :::
 
@@ -513,7 +515,7 @@ $X$ 是输入激活（batch × num\_dim），$W_i$ 是第 $i$ 个 rank 拿到的
 
 ```python
 def tensor_parallel_forward(rank, world_size, data, params):
-    # params[i] 的形状是 num_dim × local_num_dim（只有 1/world_size 的列）
+    # params[i] 的形状是 num_dim × local_dim（只有 1/world_size 的列）
     batch_size, num_dim = data.shape
     local_dim = num_dim // world_size
     x = data
