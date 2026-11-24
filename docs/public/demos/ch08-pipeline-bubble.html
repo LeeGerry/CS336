@@ -108,8 +108,8 @@ svg{width:100%;height:auto;display:block;background:var(--panel);border-radius:1
     var D={
       naive:"不切微批：整批数据先在 GPU 0 前向，再交给 GPU 1……反向再一路传回来。任意时刻只有一张卡在干活，利用率只有 1/p，其余全是气泡。",
       gpipe:"GPipe：把 batch 切成 m 个微批，前向像流水线一样依次流过各段，全部前向结束后再统一反向。气泡只出现在开头的“填充”和结尾的“排空”阶段，比例 = (p−1)/(m+p−1)。缺点：每段要同时存 m 个微批的激活（看“峰值激活”）。",
-      "1f1b":"1F1B：热身阶段先做几次前向，之后每做一次前向就做一次反向。总时长和气泡与 GPipe 相同，但第 s 段最多只同时存 p−s 个微批的激活，显存大幅下降。这是 Megatron 等框架的默认做法。",
-      zb:"零气泡（Zero Bubble）：把反向拆成两半：B 只计算“对输入的梯度”，下一段马上要用，必须尽快做；W 计算“对权重的梯度”，谁也不等它，可以拖到空闲时再做，用来填补气泡。代价是调度更复杂，W 拖得越久，激活要存得越久。"
+      "1f1b":"1F1B：热身阶段先做几次前向，之后每做一次前向就做一次反向。总时长和气泡与 GPipe 相同，但第 s 段（从 0 数起）最多只同时存 p−s 个微批的激活，显存大幅下降。这是 Megatron 等框架的默认做法。",
+      zb:"零气泡（Zero Bubble）：把反向拆成两半：B 只计算“对输入的梯度”，下一段马上要用，必须尽快做；W 计算“对权重的梯度”，谁也不等它，可以拖到空闲时再做，用来填补气泡。代价是调度更复杂，W 拖得越久，激活要存得越久。这里的排法是简化版，W 一律排在最后，所以峰值激活和 GPipe 一样高；零气泡论文里的省显存版本能把峰值激活压到和 1F1B 持平。"
     };
     $("desc").innerHTML=D[cur]+"<br><span style='color:var(--muted)'>提示：把 m 拉大，气泡占比下降，这就是“流水线需要大 batch”的原因；把 p 拉大，气泡占比上升。</span>";
   }
@@ -121,7 +121,7 @@ svg{width:100%;height:auto;display:block;background:var(--panel);border-radius:1
     $("stats").innerHTML =
       "<div class='stat'>总时长<b>"+res.T+" 个时间单位</b></div>"+
       "<div class='stat'>气泡占比（模拟）<b>"+(frac*100).toFixed(1)+"%</b></div>"+
-      "<div class='stat'>理论 (p−1)/(m+p−1)"+thLab+"<b>"+(theory*100).toFixed(1)+"%</b></div>"+
+      "<div class='stat'>理论 "+(cur==="naive"?"(p−1)/p":"(p−1)/(m+p−1)")+thLab+"<b>"+(theory*100).toFixed(1)+"%</b></div>"+
       "<div class='stat'>讲义里的比值 (p−1)/m<b>"+(cur==="naive"?"—":((p-1)/m).toFixed(2))+"</b></div>"+
       "<div class='stat'>峰值激活：GPU 0 存了几个微批<b>"+res.peak[0]+(cur==="naive"?"（整批）":"")+"</b></div>"+
       "<div class='stat'>峰值激活：最后一段<b>"+res.peak[p-1]+"</b></div>";
